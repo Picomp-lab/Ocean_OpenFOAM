@@ -1,0 +1,36 @@
+# Model weights & checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.onnx
+*.pb
+
+# Large data files
+*.tar
+*.tar.gz
+*.zip
+*.npy
+*.npz
+processed_data/
+
+# Logs
+*.log
+wandb/
+runs/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+#folders
+server_info
+

@@ -1,0 +1,74 @@
+# ============================================================
+# PINO Project Configuration (Hydra)
+# ============================================================
+
+# --- Data ---
+data:
+  raw_dir: "../data"                    # coords_2d.npy, fields.npy, times.npy
+  processed_dir: "./processed_data"
+  
+  # Domain cropping
+  x_min: -2.0
+  x_max: 16.45
+  z_min: -0.4
+  z_max: 0.15
+
+  # Regular grid resolution (~5mm isotropic, matching median mesh spacing)
+  nx: 4096
+  nz: 128
+
+  # Time selection — save ALL raw timesteps, Dataset handles stride
+  t_start: 10.0        # skip initial wave generation
+  t_end: 50.0
+  t_split: 45.0        # train: [10, 45), test: [45, 50]
+  n_input_steps: 5     # input window: 5 consecutive timesteps → predict the 6th
+
+  # Field channels: alpha(0), Ux(1), Uz(2), p_rgh(3), nut(4)
+  input_channels: [0, 1, 2, 3]    # alpha, Ux, Uz, p_rgh
+  n_input_ch: 21               # 5 steps x 4 fields + 1 mask
+
+  # Interpolation
+  interp_method: "linear"      # linear or cubic
+
+# --- Model (FNO) ---
+model:
+  modes1: 128         # Fourier modes in x
+  modes2: 32          # Fourier modes in z
+  width: 64           # hidden channel width
+  n_layers: 4         # number of Fourier layers
+  n_out_ch: 4         # predict alpha, Ux, Uz, p_rgh
+
+# --- Training ---
+train:
+  epochs: 500
+  batch_size: 4
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: "cosine"         # cosine or step
+  step_size: 100              # for step scheduler
+  gamma: 0.5                  # for step scheduler
+
+  # Physics loss (set weight > 0 to enable PINO)
+  physics_weight: 0.0         # 0 = pure FNO, >0 = PINO
+  data_weight: 1.0
+
+  # Multi-step rollout loss
+  rollout_steps: 1            # 1 = single step, >1 = multi-step
+  rollout_weight: 1.0
+
+  # Checkpointing
+  save_every: 50
+  checkpoint_dir: "${hydra:runtime.output_dir}"
+  resume: null                # path to checkpoint to resume from
+
+# --- Logging ---
+logging:
+  use_wandb: false
+  project: "pino-wave"
+  run_name: null              # auto-generated if null
+
+# --- Hardware ---
+hardware:
+  device: "cuda"
+  num_workers: 4
+  pin_memory: true

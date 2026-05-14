@@ -1,0 +1,50 @@
+# ============================================================
+# Transolver++ Wave Prediction — Hydra Config
+# ============================================================
+# Override from CLI:  python train.py model.n_hidden=256 training.lr=5e-4
+# Override with file: python train.py +experiment=big_model
+
+# --- Data ---
+data:
+  data_dir: ../data
+  train_start: 10.0
+  train_end: 45.0
+  test_start: 45.0
+  test_end: 50.0
+
+# --- Model ---
+model:
+  space_dim: 2
+  window: 5
+  channels: 5          # alpha, Ux, Uz, p_rgh, nut
+  in_dim: null
+  out_dim: 4          # alpha, Ux, Uz, p_rgh
+  n_hidden: 128
+  n_layers: 4
+  n_heads: 4
+  slice_num: 64
+  mlp_ratio: 1
+  dropout: 0.0
+  use_checkpoint: true
+
+# --- Training ---
+training:
+  epochs: 200
+  batch_size: 8
+  lr: 1e-3
+  weight_decay: 1e-5
+  max_grad_norm: 1.0
+  patience: 30
+  subset_size: null    # random subset of points per step, null = use all
+  chunk_size: 149758   # inference chunk size (full mesh)
+
+# --- Evaluation ---
+eval:
+  ar_steps: 100
+
+# --- Output ---
+output_dir: ./results
+
+# --- Field names (for logging, not model logic) ---
+input_fields: [alpha, Ux, Uz, p_rgh, nut]
+output_fields: [alpha, Ux, Uz, p_rgh]
