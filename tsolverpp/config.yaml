@@ -1,0 +1,27 @@
+data:
+  dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.3
+  train_chunks: [1,2,3,4,5,6,7]
+  val_chunks: [8,9]
+
+model:
+  n_hidden: 512
+  n_layers: 8
+  n_heads: 16
+  slice_num: 128
+  mlp_ratio: 2
+  dropout: 0.1
+
+train:
+  epochs: 100
+  batch_size: 2
+  lr: 1e-4
+  weight_decay: 1e-5
+  window: 6
+  rollout_steps: 4
+  loss_weight_aux: 0.1
+  save_dir: "${hydra:runtime.output_dir}/checkpoints"
+  resume: false
+
+wandb:
+  project: tsolverpp
+  enabled: true
