@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=tsolver3d
 #SBATCH --partition=dgxh
+#SBATCH --nodelist=dgxh-3
 #SBATCH --gres=gpu:1
+# --constraint=h200
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=72G
-#SBATCH --time=6:00:00
+#SBATCH --time=20:00:00
 #SBATCH --output=logs/tsolverpp_%j.log
-#SBATCH --nodelist=dgxh-4
 
 
 source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh
@@ -21,5 +22,7 @@ echo "========================================="
 
 cd ~/hpc-share/models/tsolverpp
 
+
+
 # torchrun --nproc_per_node=2 train.py
-python -u train.py
+python -u train.py model.dropout=0.2 train.weight_decay=1e-3

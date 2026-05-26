@@ -1,0 +1,31 @@
+data:
+  dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05
+  train_chunks: [1, 2, 3, 4, 5, 6, 7]
+  val_chunks: [8, 9]
+  window: 6
+
+model:
+  n_hidden: 128
+  n_layers: 6
+  n_heads: 8
+  freq_num: 64
+  dropout: 0.05
+  mlp_ratio: 2
+  spectral_pos_dim: 16
+  use_ckpt: true
+
+train:
+  batch_size: 1
+  lr: 5e-4
+  weight_decay: 1e-4
+  epochs: 50
+  max_grad_norm: 0.1
+  num_workers: 4
+
+save:
+  dir: ${hydra:runtime.output_dir}/checkpoints
+
+wandb:
+  enabled: true
+  project: hpm-wave
+  name: hpm_h128_l6_f64_spd16

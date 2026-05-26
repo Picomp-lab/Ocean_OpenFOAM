@@ -10,7 +10,7 @@
 source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh
 conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
 
-cd ~/hpc-share/paper_models/transolver++
+cd ~/hpc-share/models/transolver++
 
 echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
 

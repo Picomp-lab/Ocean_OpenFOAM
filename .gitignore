@@ -21,6 +21,7 @@ processed_data/
 wandb/
 runs/
 logs/
+outputs/
 
 # Python
 __pycache__/
@@ -31,6 +32,7 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-#folders
+# folders
 server_info
-
+env_info
+data/

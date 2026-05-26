@@ -1,0 +1,37 @@
+data:
+  dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05
+  train_chunks:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  val_chunks:
+  - 8
+  - 9
+  window: 6
+model:
+  n_hidden: 64
+  n_layers: 4
+  n_heads: 8
+  freq_num: 64
+  dropout: 0.0
+  mlp_ratio: 1
+  spectral_pos_dim: 0
+  use_ckpt: true
+train:
+  batch_size: 1
+  lr: 0.0001
+  weight_decay: 1.0e-05
+  epochs: 5
+  max_grad_norm: 0.1
+  num_workers: 4
+save:
+  dir: ${oc.env:HOME}/hpc-share/models/hpm/checkpoints
+wandb:
+  enabled: true
+  project: hpm-wave
+  name: hpm_h64_l4_f64
