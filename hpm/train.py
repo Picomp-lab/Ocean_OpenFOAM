@@ -54,20 +54,71 @@ class WeightedMSELoss(nn.Module):
 # Train / Validate
 # ============================================================
 
+def multistep_rollout_loss(model, coords, window_fields, future_frames,
+                           criterion, field_dim=6, window=6):
+    """
+    Multi-step autoregressive rollout loss.
+
+    Args:
+        model:         HPM model
+        coords:        (B, N, 3) — spatial coordinates
+        window_fields: (B, N, W*F) — initial window, flattened
+        future_frames: (B, R, N, F) — R ground truth future frames
+        criterion:     loss function
+        field_dim:     number of physical fields (6)
+        window:        temporal window size (W)
+
+    Returns:
+        total_loss: sum of per-step losses
+    """
+    B, R, N, F = future_frames.shape
+    current_window = window_fields  # (B, N, W*F)
+    total_loss = 0.0
+
+    for step in range(R):
+        # Predict delta
+        delta_pred = model(coords, current_window)             # (B, N, F)
+
+        # Current frame = last frame in window
+        current_frame = current_window[:, :, -field_dim:]      # (B, N, F)
+
+        # Ground truth delta
+        gt_frame = future_frames[:, step]                      # (B, N, F)
+        gt_delta = gt_frame - current_frame                    # (B, N, F)
+
+        # Loss for this step
+        total_loss = total_loss + criterion(delta_pred, gt_delta)
+
+        # Predicted next frame (detach-free — gradients flow through all steps)
+        pred_frame = current_frame + delta_pred                # (B, N, F)
+
+        # Shift window: drop oldest frame, append prediction
+        # current_window: (B, N, W*F) -> drop first F, append pred F
+        current_window = torch.cat([
+            current_window[:, :, field_dim:],                  # (B, N, (W-1)*F)
+            pred_frame                                         # (B, N, F)
+        ], dim=-1)                                             # (B, N, W*F)
+
+    return total_loss / R
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device,
-                    max_grad_norm, coords, scheduler=None):
+                    max_grad_norm, coords, scheduler=None,
+                    field_dim=6, window=6):
     model.train()
     total_loss = 0.0
     n_batches = 0
 
-    for fields, target in loader:
-        fields = fields.to(device)
-        target = target.to(device)
+    for fields, future in loader:
+        fields = fields.to(device)                             # (B, N, W*F)
+        future = future.to(device)                             # (B, R, N, F)
         coords_batch = coords.unsqueeze(0).expand(fields.shape[0], -1, -1)
 
         optimizer.zero_grad()
-        pred = model(coords_batch, fields)
-        loss = criterion(pred, target)
+        loss = multistep_rollout_loss(
+            model, coords_batch, fields, future, criterion,
+            field_dim=field_dim, window=window
+        )
         loss.backward()
 
         if max_grad_norm > 0:
@@ -84,18 +135,20 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, coords):
+def validate(model, loader, criterion, device, coords, field_dim=6, window=6):
     model.eval()
     total_loss = 0.0
     n_batches = 0
 
-    for fields, target in loader:
+    for fields, future in loader:
         fields = fields.to(device)
-        target = target.to(device)
+        future = future.to(device)
         coords_batch = coords.unsqueeze(0).expand(fields.shape[0], -1, -1)
 
-        pred = model(coords_batch, fields)
-        loss = criterion(pred, target)
+        loss = multistep_rollout_loss(
+            model, coords_batch, fields, future, criterion,
+            field_dim=field_dim, window=window
+        )
         total_loss += loss.item()
         n_batches += 1
 
@@ -141,9 +194,13 @@ def main(cfg: DictConfig):
         print(f"Loaded stats: mean={stats[0]}, std={stats[1]}")
 
     # ---- Dataset ----
-    train_set = WaveDataset(cfg.data.dir, cfg.data.train_chunks, cfg.data.window, stats)
-    val_set = WaveDataset(cfg.data.dir, cfg.data.val_chunks, cfg.data.window, stats)
+    rollout_steps = cfg.train.get('rollout_steps', 4)
+    train_set = WaveDataset(cfg.data.dir, cfg.data.train_chunks, cfg.data.window,
+                            stats, rollout_steps=rollout_steps)
+    val_set = WaveDataset(cfg.data.dir, cfg.data.val_chunks, cfg.data.window,
+                          stats, rollout_steps=rollout_steps)
     print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}")
+    print(f"Rollout steps: {rollout_steps}")
 
     train_loader = DataLoader(train_set, batch_size=cfg.train.batch_size, shuffle=True,
                               num_workers=cfg.train.num_workers, pin_memory=True)
@@ -210,8 +267,9 @@ def main(cfg: DictConfig):
         t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion,
                                      device, cfg.train.max_grad_norm, coords,
-                                     scheduler)
-        val_loss = validate(model, val_loader, criterion, device, coords)
+                                     scheduler, field_dim=6, window=cfg.data.window)
+        val_loss = validate(model, val_loader, criterion, device, coords,
+                           field_dim=6, window=cfg.data.window)
 
         lr = optimizer.param_groups[0]['lr']
         elapsed = time.time() - t0
@@ -223,7 +281,12 @@ def main(cfg: DictConfig):
             wandb.log({"train_loss": train_loss, "val_loss": val_loss,
                         "lr": lr, "epoch": epoch})
 
-        # Save latest
+        # Update best_val first
+        is_best = val_loss < best_val
+        if is_best:
+            best_val = val_loss
+
+        # Save latest (always has current best_val)
         ckpt = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -234,9 +297,7 @@ def main(cfg: DictConfig):
         torch.save(ckpt, latest_path)
 
         # Save best
-        if val_loss < best_val:
-            best_val = val_loss
-            ckpt["best_val"] = best_val
+        if is_best:
             torch.save(ckpt, save_dir / "best.pt")
             print(f"  → New best: {best_val:.6f}")
 

@@ -1,15 +1,9 @@
 """
-Dataset for HPM time-stepping prediction.
+Dataset for HPM time-stepping prediction with multi-step rollout support.
 
-Loads chunked .npy files from cropped OpenFOAM data.
-Returns temporal windows of W consecutive frames with normalization.
-
-Coords are NOT returned per-sample (they're identical for every sample
-on a fixed mesh). Instead, load coords once via get_coords() and send
-to GPU outside the training loop.
-
-Data are stored as torch.Tensor (not numpy) to avoid Copy-on-Write
-memory explosion with num_workers > 0.
+Returns temporal window + R consecutive future frames for multi-step loss.
+Coords are NOT returned per-sample — use load_coords() separately.
+Data stored as torch.Tensor for shared memory with DataLoader workers.
 
 Data layout on disk:
     data_dir/
@@ -73,19 +67,26 @@ def load_coords(data_dir):
 
 class WaveDataset(Dataset):
     """
-    Dataset yielding (window_fields, target_delta) tuples.
+    Dataset yielding (window_fields, future_frames) tuples.
 
     Each sample:
         window_fields: (N, W*6) float32 — W consecutive normalized frames, flattened
-        target_delta:  (N, 6) float32   — normalized delta (next - current)
+        future_frames: (R, N, 6) float32 — R future frames (normalized, absolute values)
 
-    Coords are NOT included — use load_coords() separately.
+    During training, the loss function handles:
+      - Autoregressive rollout for R steps
+      - Delta computation (residual learning) at each step
+      - Accumulation of per-step losses
+
+    Args:
+        rollout_steps: number of future frames to return (default 4)
     """
 
-    def __init__(self, data_dir, chunk_ids, window=6, stats=None):
+    def __init__(self, data_dir, chunk_ids, window=6, stats=None, rollout_steps=4):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.window = window
+        self.rollout_steps = rollout_steps
         self.N = np.load(self.data_dir / "coords.npy").shape[0]
 
         # Load or compute stats
@@ -97,11 +98,9 @@ class WaveDataset(Dataset):
                 self.stats = np.load(stats_path)
             else:
                 self.stats = compute_stats(self.data_dir, chunk_ids)
-        self.mean = self.stats[0]  # (6,)
-        self.std = self.stats[1]   # (6,)
+        self.mean = self.stats[0]
+        self.std = self.stats[1]
 
-        # Load and normalize all chunks, store as torch.Tensor for
-        # shared memory with DataLoader workers (avoids numpy CoW)
         self.chunks = []
         self.samples = []
         self._build_samples(chunk_ids)
@@ -111,11 +110,14 @@ class WaveDataset(Dataset):
         for cid in chunk_ids:
             data = np.load(self.data_dir / f"chunk_{cid:03d}_data.npy")  # (T, N, 6)
             data_norm = ((data - self.mean) / self.std).astype(np.float32)
-            # Convert to torch.Tensor — uses shared memory across workers
-            self.chunks.append(torch.from_numpy(data_norm))
+            # .clone() detaches from numpy memory, .share_memory_() makes
+            # it safe for multi-worker DataLoader (avoids CoW on fork)
+            tensor = torch.from_numpy(data_norm).clone().share_memory_()
+            self.chunks.append(tensor)
 
             T = data.shape[0]
-            for t in range(self.window, T):
+            # Need W frames for input + R frames for targets
+            for t in range(self.window, T - self.rollout_steps + 1):
                 self.samples.append((len(self.chunks) - 1, t))
 
     def __len__(self):
@@ -125,15 +127,13 @@ class WaveDataset(Dataset):
         chunk_idx, t = self.samples[idx]
         chunk = self.chunks[chunk_idx]
 
-        # Window: frames [t-W, ..., t-1], target: frame t
+        # Window: frames [t-W, ..., t-1]
         window_frames = chunk[t - self.window:t]    # (W, N, 6)
-        target_frame = chunk[t]                      # (N, 6)
-        current_frame = chunk[t - 1]                 # (N, 6)
+
+        # Future R frames: [t, t+1, ..., t+R-1] — absolute values
+        future = chunk[t:t + self.rollout_steps]     # (R, N, 6)
 
         # Flatten window: (W, N, 6) -> (N, W*6)
         window_flat = window_frames.permute(1, 0, 2).reshape(self.N, -1)
 
-        # Target: delta (residual learning)
-        delta = target_frame - current_frame          # (N, 6)
-
-        return window_flat, delta
+        return window_flat, future

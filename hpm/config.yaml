@@ -9,7 +9,7 @@ model:
   n_layers: 6
   n_heads: 8
   freq_num: 64
-  dropout: 0.05
+  dropout: 0.1
   mlp_ratio: 2
   spectral_pos_dim: 16
   use_ckpt: true
@@ -18,9 +18,10 @@ train:
   batch_size: 1
   lr: 5e-4
   weight_decay: 1e-4
-  epochs: 50
+  epochs: 100
   max_grad_norm: 0.1
   num_workers: 4
+  rollout_steps: 4
 
 save:
   dir: ${hydra:runtime.output_dir}/checkpoints
@@ -28,4 +29,4 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  name: hpm_h128_l6_f64_spd16
+  name: hpm_h128_l6_f64_spd16_roll4

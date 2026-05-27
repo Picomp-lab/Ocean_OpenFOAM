@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=hpmt
 #SBATCH --partition=dgxh
-#SBATCH --exclude=dgxh-1
+#SBATCH --nodelist=dgxh-4
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
