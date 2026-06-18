@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=lbo_eigen
+#SBATCH --job-name=lboei
 #SBATCH --partition=eecs
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --time=06:00:00
-#SBATCH --output=lbo_eigen_%j.log
+#SBATCH --output=logs/lbo_eigen_%j.log
 
 # ============================================================
 # Paths — update these to match your setup
@@ -21,7 +21,7 @@ COORDS="$HOME/hpc-share/models/data/3d/cropped_0.05/coords.npy"
 CELLSET="subdomainCells"
 
 # Number of eigenvectors to compute
-K=64
+K=128
 
 # Output directory for eigenvectors
 OUTPUT_DIR="$HOME/hpc-share/models/data/3d/cropped_0.05/lbo"
