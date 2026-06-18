@@ -5,20 +5,23 @@ data:
   window: 6
 
 model:
-  n_hidden: 128
-  n_layers: 6
+  n_hidden: 64
+  n_layers: 4
   n_heads: 8
   freq_num: 64
-  dropout: 0.1
-  mlp_ratio: 2
-  spectral_pos_dim: 16
+  dropout: 0.0
+  mlp_ratio: 1
+  spectral_pos_dim: 0
   use_ckpt: true
+  use_phase_gate: true
+  gate_alpha_0: 0.4
+  gate_k_init: 40.0
 
 train:
   batch_size: 1
-  lr: 5e-4
-  weight_decay: 1e-4
-  epochs: 100
+  lr: 1e-4
+  weight_decay: 1e-5
+  epochs: 50
   max_grad_norm: 0.1
   num_workers: 4
   rollout_steps: 4
@@ -29,4 +32,4 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  name: hpm_h128_l6_f64_spd16_roll4
+  name: hpm_gated_a04_k40

@@ -36,17 +36,44 @@ from dataset import WaveDataset, compute_stats, load_coords
 # ============================================================
 
 class WeightedMSELoss(nn.Module):
-    """Per-channel weighted MSE. Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]"""
+    """Per-channel weighted MSE with optional phase-gate weighting.
 
-    def __init__(self, weights=None):
+    Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]
+
+    When use_phase_gate is True, U (1,2,3) and nut (5) loss is weighted by
+    gate = sigmoid(k*(alpha_gt - alpha_0)) — air-phase (low alpha) contributions
+    are suppressed, consistent with the forward-pass gating. alpha and p_rgh
+    keep full weight.
+    """
+
+    def __init__(self, weights=None, use_phase_gate=False,
+                 gate_alpha_0=0.1, gate_k=30.0):
         super().__init__()
         if weights is None:
             weights = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1]
         self.register_buffer('weights', torch.tensor(weights, dtype=torch.float32))
+        self.use_phase_gate = use_phase_gate
+        self.gate_alpha_0 = gate_alpha_0
+        self.gate_k = gate_k
+        # channels to gate: U (1,2,3) and nut (5)
+        gate_mask = torch.zeros(6)
+        gate_mask[[1, 2, 3, 5]] = 1.0
+        self.register_buffer('gate_channel_mask', gate_mask)
 
-    def forward(self, pred, target):
-        mse = (pred - target) ** 2
-        weighted = mse * self.weights[None, None, :]
+    def forward(self, pred, target, alpha_gt=None):
+        mse = (pred - target) ** 2                     # (B, N, F)
+        w = self.weights[None, None, :]                # (1, 1, F)
+
+        if self.use_phase_gate and alpha_gt is not None:
+            # gate weight from GT alpha (clean signal during training)
+            gate = torch.sigmoid(self.gate_k * (alpha_gt - self.gate_alpha_0))  # (B, N, 1)
+            cmask = self.gate_channel_mask[None, None, :]  # (1, 1, F)
+            # gated channels: weight *= gate; others: weight unchanged
+            gate_w = (1 - cmask) + cmask * gate         # (B, N, F)
+            weighted = mse * w * gate_w
+        else:
+            weighted = mse * w
+
         return weighted.mean()
 
 
@@ -86,8 +113,11 @@ def multistep_rollout_loss(model, coords, window_fields, future_frames,
         gt_frame = future_frames[:, step]                      # (B, N, F)
         gt_delta = gt_frame - current_frame                    # (B, N, F)
 
+        # GT alpha (channel 0) for phase-gate loss weighting
+        alpha_gt = gt_frame[:, :, 0:1]                         # (B, N, 1)
+
         # Loss for this step
-        total_loss = total_loss + criterion(delta_pred, gt_delta)
+        total_loss = total_loss + criterion(delta_pred, gt_delta, alpha_gt)
 
         # Predicted next frame (detach-free — gradients flow through all steps)
         pred_frame = current_frame + delta_pred                # (B, N, F)
@@ -227,6 +257,10 @@ def main(cfg: DictConfig):
         spectral_embedding=spectral_embedding,
         use_ckpt=cfg.model.use_ckpt,
         max_grad_norm=cfg.train.max_grad_norm,
+        use_phase_gate=cfg.model.get('use_phase_gate', False),
+        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.5),
+        gate_k_init=cfg.model.get('gate_k_init', 10.0),
+        stats=stats,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -239,7 +273,11 @@ def main(cfg: DictConfig):
         optimizer, max_lr=cfg.train.lr, epochs=cfg.train.epochs,
         steps_per_epoch=len(train_loader), pct_start=0.1
     )
-    criterion = WeightedMSELoss().to(device)
+    criterion = WeightedMSELoss(
+        use_phase_gate=cfg.model.get('use_phase_gate', False),
+        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.1),
+        gate_k=cfg.model.get('gate_k_init', 30.0),
+    ).to(device)
 
     # ---- Resume ----
     start_epoch = 0
@@ -278,8 +316,11 @@ def main(cfg: DictConfig):
 
         # wandb
         if HAS_WANDB and cfg.wandb.enabled:
-            wandb.log({"train_loss": train_loss, "val_loss": val_loss,
-                        "lr": lr, "epoch": epoch})
+            wandb.log({"train_loss": train_loss,
+                       "val_loss": val_loss,
+                       "lr": lr,
+                       "epoch": epoch
+                       })
 
         # Update best_val first
         is_best = val_loss < best_val

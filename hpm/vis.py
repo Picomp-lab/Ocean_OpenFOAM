@@ -58,7 +58,8 @@ def main():
     parser.add_argument("--chunk_id", type=int, required=True)
     parser.add_argument("--start_frame", type=int, default=6)
     parser.add_argument("--n_frames", type=int, default=93)
-    parser.add_argument("--field", type=int, default=0)
+    parser.add_argument("--field", type=int, default=0,
+                        help="0=alpha, 1=Ux, 2=Uy, 3=Uz, 4=p_rgh, 5=nut, 6=|U|")
     parser.add_argument("--output", type=str, default="compare.mp4")
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--device", type=str, default="cuda")
@@ -75,6 +76,8 @@ def main():
     lbo_path = data_dir / "lbo" / "lbo_eigenvectors.npy"
     spectral_embedding = np.load(lbo_path)
 
+    stats = np.load(data_dir / "stats.npy")
+
     model = HPM(
         space_dim=3,
         field_dim=6,
@@ -89,6 +92,10 @@ def main():
         spectral_pos_dim=cfg.model.get('spectral_pos_dim', 0),
         spectral_embedding=spectral_embedding,
         use_ckpt=False,
+        use_phase_gate=cfg.model.get('use_phase_gate', False),
+        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.5),
+        gate_k_init=cfg.model.get('gate_k_init', 10.0),
+        stats=stats,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -113,7 +120,7 @@ def main():
     gts = data[start + 1: start + 1 + n_steps]  # (n_steps, N, 6)
     gt_times = times[start + 1: start + 1 + n_steps]
 
-    # Y midplane slice
+    # Y midplane slice — same method as vis_rgb_velocity.py
     y_vals = coords[:, 1]
     mid_y = y_vals.min() + (y_vals.max() - y_vals.min()) / 2.0
     mask = np.abs(y_vals - mid_y) < 0.015
@@ -121,8 +128,18 @@ def main():
 
     x_raw = coords[mask, 0]
     z_raw = coords[mask, 2]
-    gt_slice = gts[:, mask, fi]
-    pred_slice = preds[:, mask, fi]
+
+    # Field extraction: fi=6 is velocity magnitude
+    field_names = ["alpha.water", "Ux", "Uy", "Uz", "p_rgh", "nut", "|U|"]
+    fname = field_names[fi]
+
+    if fi == 6:
+        # Velocity magnitude: sqrt(Ux² + Uy² + Uz²)
+        gt_slice = np.sqrt(gts[:, mask, 1]**2 + gts[:, mask, 2]**2 + gts[:, mask, 3]**2)
+        pred_slice = np.sqrt(preds[:, mask, 1]**2 + preds[:, mask, 2]**2 + preds[:, mask, 3]**2)
+    else:
+        gt_slice = gts[:, mask, fi]
+        pred_slice = preds[:, mask, fi]
 
     # Interpolation grid
     grid_x, grid_z = np.mgrid[
@@ -139,6 +156,10 @@ def main():
         }
         custom_cmap = LinearSegmentedColormap('OpacityReds', cdict)
         levels = np.linspace(0, 1, 128)
+    elif fi == 6:
+        custom_cmap = 'magma'
+        all_vals = np.concatenate([gt_slice.ravel(), pred_slice.ravel()])
+        levels = np.linspace(0, np.percentile(all_vals, 99), 128)
     else:
         custom_cmap = 'coolwarm'
         all_vals = np.concatenate([gt_slice.ravel(), pred_slice.ravel()])
@@ -156,9 +177,6 @@ def main():
                    cmap=custom_cmap, extend='both')
     ax_pred.contourf(grid_x[:, 0], grid_z[0, :], pred_grid.T, levels=levels,
                      cmap=custom_cmap, extend='both')
-
-    field_names = ["alpha.water", "Ux", "Uy", "Uz", "p_rgh", "nut"]
-    fname = field_names[fi]
 
     for ax, label in [(ax_gt, "Ground Truth"), (ax_pred, "HPM Prediction")]:
         ax.set_facecolor('white')
