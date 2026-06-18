@@ -190,13 +190,39 @@ class HPM(nn.Module):
                  spectral_pos_dim=0,
                  spectral_embedding=None,
                  use_ckpt=True,
-                 max_grad_norm=0.1):
+                 max_grad_norm=0.1,
+                 use_phase_gate=False,
+                 gate_alpha_0=0.5,
+                 gate_k_init=10.0,
+                 stats=None):
         super().__init__()
         assert window >= 3, "Window must be >= 3 for finite differences"
         self.field_dim = field_dim
         self.window = window
         self.spectral_pos_dim = spectral_pos_dim
         self.max_grad_norm = max_grad_norm
+
+        # --- Phase gate (suppress air-phase divergence in U, nut) ---
+        # Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]
+        # Gate U (1,2,3) and nut (5); NOT alpha (0, gate source) or p_rgh (4, atmospheric ref)
+        self.use_phase_gate = use_phase_gate
+        if use_phase_gate:
+            self.gate_alpha_0 = gate_alpha_0
+            # learnable steepness k (softplus to keep positive)
+            self.gate_k = nn.Parameter(torch.tensor(float(gate_k_init)))
+            # channels to gate: U (1,2,3) and nut (5)
+            gate_mask = torch.zeros(field_dim)
+            gate_mask[[1, 2, 3, 5]] = 1.0
+            self.register_buffer('gate_channel_mask', gate_mask)  # (F,)
+
+            # rest value = physical zero in normalized space = (0 - mean) / std
+            if stats is not None:
+                mean = torch.tensor(stats[0], dtype=torch.float32)
+                std = torch.tensor(stats[1], dtype=torch.float32)
+                rest_norm = (0.0 - mean) / std  # (F,)
+            else:
+                rest_norm = torch.zeros(field_dim)
+            self.register_buffer('rest_value', rest_norm)  # (F,)
 
         # --- Temporal feature extraction ---
         self.time_aggregator = nn.Linear(window, 1)
@@ -301,4 +327,29 @@ class HPM(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        return x  # (B, N, out_dim) — delta prediction
+        delta = x  # (B, N, out_dim) — raw delta prediction
+
+        if not self.use_phase_gate:
+            return delta
+
+        # --- Phase gate ---
+        # Current frame = most recent frame in window
+        current = fields_4d[:, :, -1, :]              # (B, N, F)
+        pred = current + delta                         # (B, N, F) raw prediction
+
+        # Predicted alpha (channel 0) drives the gate
+        pred_alpha = pred[:, :, 0:1]                    # (B, N, 1)
+        k = torch.nn.functional.softplus(self.gate_k)  # keep positive
+        gate = torch.sigmoid(k * (pred_alpha - self.gate_alpha_0))  # (B, N, 1)
+
+        # Gated prediction: pull gated channels toward rest where gate→0 (air)
+        rest = self.rest_value.view(1, 1, -1)          # (1, 1, F)
+        cmask = self.gate_channel_mask.view(1, 1, -1)  # (1, 1, F)
+
+        # For gated channels: pred_gated = pred*gate + rest*(1-gate)
+        # For non-gated channels: keep pred as-is
+        pred_gated = pred * gate + rest * (1 - gate)
+        pred_final = pred * (1 - cmask) + pred_gated * cmask
+
+        # Return as delta (so residual-learning convention is preserved)
+        return pred_final - current
