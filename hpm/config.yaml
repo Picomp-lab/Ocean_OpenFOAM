@@ -8,7 +8,7 @@ model:
   n_hidden: 128
   n_layers: 6
   n_heads: 8
-  freq_num: 64
+  freq_num: 128
   dropout: 0.1
   mlp_ratio: 2
   spectral_pos_dim: 16
@@ -16,7 +16,7 @@ model:
 
 train:
   batch_size: 1
-  lr: 5e-4
+  lr: 3.5e-4
   weight_decay: 1e-4
   epochs: 100
   max_grad_norm: 0.1
@@ -29,4 +29,4 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  name: hpm_h128_l6_f64_spd16_roll4
+  name: hpm_h128_l6_f128_spd16_roll4
