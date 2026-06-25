@@ -1,21 +1,17 @@
 """
-RGB Velocity Visualization for HPM rollout.
+RGB Velocity Visualization for HPM rollout — PyVista-slice based.
 
-Encodes 3D velocity as color:
-  R = |Ux| / max|Ux|
-  G = |Uy| / max|Uy|
-  B = |Uz| / max|Uz|
-  Alpha = |U| / max|U|  (static water = transparent)
+速度三分量编码为颜色（αU 或 U 空间，由模型 config 决定，不还原）：
+  R = |Ux|/max, G = |Uy|/max, B = |Uz|/max, Opacity = |U|/max
+  pred 上叠加方向误差（>90° 标黄）。
+Top: GT, Bottom: HPM Prediction.
 
-Top: Ground Truth, Bottom: HPM Prediction.
+切片几何用预计算缓存 (slice_y0.30/)，运行时纯 numpy。
+--style both 输出 {output}_tri.mp4（精准连续）和 {output}_scatter.mp4（快速离散）。
 
 Usage:
-    python -u vis_rgb_velocity.py \
-        --config_path /path/to/.hydra/config.yaml \
-        --checkpoint /path/to/best.pt \
-        --data_dir /path/to/cropped_0.05 \
-        --chunk_id 6 \
-        --output rgb_velocity_chunk6.mp4
+    python -u vis_u.py --config_path .../config.yaml --checkpoint .../best.pt \
+        --data_dir .../cropped_0.05 --chunk_id 6 --output rgb_vel_chunk6.mp4
 """
 
 import argparse
@@ -25,23 +21,26 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from scipy.interpolate import griddata
+import matplotlib.tri as mtri
+from matplotlib.collections import PolyCollection
 from pathlib import Path
 from omegaconf import OmegaConf
 
 from hpm_model import HPM
-from dataset import load_coords
+from dataset import load_coords, apply_alpha_weighting, stats_filename, expand_range
+
+MID_Y = 0.30
 
 
 @torch.no_grad()
-def rollout(model, coords_norm, data, stats, window, start_frame, n_steps, device):
+def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps, device):
     mean, std = stats[0], stats[1]
     normalize = lambda x: (x - mean) / std
     denormalize = lambda x: x * std + mean
 
     predictions = []
     fields_w = np.concatenate(
-        [normalize(data[start_frame - window + 1 + w]) for w in range(window)],
+        [normalize(data_w[start_frame - window + 1 + w]) for w in range(window)],
         axis=-1)
     fields_w = torch.from_numpy(fields_w.astype(np.float32)).unsqueeze(0).to(device)
     coords_batch = coords_norm.unsqueeze(0)
@@ -56,37 +55,21 @@ def rollout(model, coords_norm, data, stats, window, start_frame, n_steps, devic
     return np.stack(predictions)
 
 
-def build_rgba(ux, uy, uz, ux_max, uy_max, uz_max, umag_max):
-    """
-    Build RGBA image from velocity components.
-
-    Args:
-        ux, uy, uz: (H, W) arrays — interpolated velocity on grid
-        ux_max, uy_max, uz_max: global max for normalization
-        umag_max: global max |U| for alpha normalization
-
-    Returns:
-        rgba: (H, W, 4) float array in [0, 1]
-    """
-    r = np.abs(ux) / max(ux_max, 1e-10)
-    g = np.abs(uy) / max(uy_max, 1e-10)
-    b = np.abs(uz) / max(uz_max, 1e-10)
+def build_rgba_points(ux, uy, uz, ux_max, uy_max, uz_max, umag_max):
+    """逐点 RGBA。ux/uy/uz: (M,) 切片点上的速度分量。返回 (M,4)。"""
+    r = np.clip(np.abs(ux) / max(ux_max, 1e-10), 0, 1)
+    g = np.clip(np.abs(uy) / max(uy_max, 1e-10), 0, 1)
+    b = np.clip(np.abs(uz) / max(uz_max, 1e-10), 0, 1)
     umag = np.sqrt(ux**2 + uy**2 + uz**2)
-    a = umag / max(umag_max, 1e-10)
+    a = np.clip(umag / max(umag_max, 1e-10), 0, 1)
+    return np.stack([r, g, b, a], axis=-1)
 
-    # Clamp to [0, 1]
-    r = np.clip(r, 0, 1)
-    g = np.clip(g, 0, 1)
-    b = np.clip(b, 0, 1)
-    a = np.clip(a, 0, 1)
 
-    rgba = np.stack([r, g, b, a], axis=-1)
-
-    # NaN regions (outside convex hull of griddata) → fully transparent
-    nan_mask = np.isnan(ux) | np.isnan(uy) | np.isnan(uz)
-    rgba[nan_mask] = 0
-
-    return rgba
+def composite_over_bg(rgba, bg):
+    """RGBA over 背景色 -> RGB。rgba:(M,4), bg:(3,)。返回 (M,3)。"""
+    a = rgba[:, 3:4]
+    rgb = rgba[:, :3]
+    return np.clip(rgb * a + np.array(bg).reshape(1, 3) * (1 - a), 0, 1)
 
 
 def main():
@@ -98,228 +81,168 @@ def main():
     parser.add_argument("--start_frame", type=int, default=6)
     parser.add_argument("--n_frames", type=int, default=93)
     parser.add_argument("--output", type=str, default="rgb_velocity.mp4")
+    parser.add_argument("--style", type=str, default="both",
+                        choices=["tri", "scatter", "both"])
     parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--point_size", type=float, default=6.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--bg_color", type=float, nargs=3, default=[0.15, 0.15, 0.15],
-                        help="Background color RGB [0-1]")
+    parser.add_argument("--bg_color", type=float, nargs=3, default=[0.15, 0.15, 0.15])
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    bg = args.bg_color
 
-    # Load model
+    # ---- model + config ----
     print("Loading model...")
     cfg = OmegaConf.load(args.config_path)
-
-    lbo_path = data_dir / "lbo" / "lbo_eigenvectors.npy"
-    spectral_embedding = np.load(lbo_path)
-
-    stats = np.load(data_dir / "stats.npy")
+    spectral_embedding = np.load(data_dir / "lbo" / "lbo_eigenvectors.npy")
+    weight_u = cfg.data.get('weight_u_by_alpha', True)
+    weight_nut = cfg.data.get('weight_nut_by_alpha', False)
+    train_chunks = expand_range(cfg.data.train_chunk_range)
+    stats = np.load(data_dir / stats_filename(train_chunks, weight_u=weight_u, weight_nut=weight_nut))
 
     model = HPM(
         space_dim=3, field_dim=6, out_dim=6,
         window=cfg.data.window,
-        n_hidden=cfg.model.n_hidden,
-        n_layers=cfg.model.n_layers,
-        n_heads=cfg.model.n_heads,
-        freq_num=cfg.model.freq_num,
-        dropout=0.0,
-        mlp_ratio=cfg.model.mlp_ratio,
+        n_hidden=cfg.model.n_hidden, n_layers=cfg.model.n_layers,
+        n_heads=cfg.model.n_heads, freq_num=cfg.model.freq_num,
+        dropout=0.0, mlp_ratio=cfg.model.mlp_ratio,
         spectral_pos_dim=cfg.model.get('spectral_pos_dim', 0),
-        spectral_embedding=spectral_embedding,
-        use_ckpt=False,
-        use_phase_gate=cfg.model.get('use_phase_gate', False),
-        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.5),
-        gate_k_init=cfg.model.get('gate_k_init', 10.0),
-        stats=stats,
+        spectral_embedding=spectral_embedding, use_ckpt=False,
     ).to(device)
-
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
+    model.load_state_dict(ckpt["model"]); model.eval()
 
-    # Load data
+    # ---- data + αU ----
     print("Loading data...")
-    coords = np.load(data_dir / "coords.npy")
-    data = np.load(data_dir / f"chunk_{args.chunk_id:03d}_data.npy")
+    raw = np.load(data_dir / f"chunk_{args.chunk_id:03d}_data.npy")
     times = np.load(data_dir / f"chunk_{args.chunk_id:03d}_times.npy")
-    stats = np.load(data_dir / "stats.npy")
     coords_norm = load_coords(args.data_dir).to(device)
+    print(f"Alpha-weighting: U={weight_u}, nut={weight_nut}")
+    data_w = apply_alpha_weighting(raw, weight_u=weight_u, weight_nut=weight_nut)
 
     W = cfg.data.window
     start = max(args.start_frame, W - 1)
-    n_steps = min(args.n_frames, data.shape[0] - start - 1)
+    n_steps = min(args.n_frames, data_w.shape[0] - start - 1)
 
-    # Rollout
-    print(f"Rolling out {n_steps} steps from frame {start}...")
-    preds = rollout(model, coords_norm, data, stats, W, start, n_steps, device)
-    gts = data[start + 1: start + 1 + n_steps]
+    print(f"Rolling out {n_steps} steps...")
+    preds = rollout(model, coords_norm, data_w, stats, W, start, n_steps, device)
+    gts = data_w[start + 1: start + 1 + n_steps]
     gt_times = times[start + 1: start + 1 + n_steps]
 
-    # Y midplane slice — same method as inference.py
-    y_vals = coords[:, 1]
-    mid_y = y_vals.min() + (y_vals.max() - y_vals.min()) / 2.0
-    mask = np.abs(y_vals - mid_y) < 0.015
-    print(f"Midplane slice: {mask.sum()} points")
+    # ---- slice cache ----
+    sdir = data_dir / f"slice_y{MID_Y:.2f}"
+    cell_map = np.load(sdir / "slice_cell_map.npy")
+    xz = np.load(sdir / "slice_xz.npy")
+    tri_simplices = np.load(sdir / "slice_tri.npy")
+    x_s, z_s = xz[:, 0], xz[:, 1]
+    triang = mtri.Triangulation(x_s, z_s, triangles=tri_simplices)
+    print(f"Slice cache: {len(cell_map)} faces @ y={MID_Y}")
 
-    x_raw = coords[mask, 0]
-    z_raw = coords[mask, 2]
+    # 速度分量在切片点上 (n_steps, M)
+    gt_u = (gts[:, cell_map, 1], gts[:, cell_map, 2], gts[:, cell_map, 3])
+    pr_u = (preds[:, cell_map, 1], preds[:, cell_map, 2], preds[:, cell_map, 3])
 
-    # Interpolation grid
-    grid_x, grid_z = np.mgrid[
-        x_raw.min():x_raw.max():2000j,
-        z_raw.min():z_raw.max():400j
-    ]
+    # 归一化用 GT 的 αU/U percentile
+    ux_max = np.percentile(np.abs(gt_u[0]), 99)
+    uy_max = np.percentile(np.abs(gt_u[1]), 99)
+    uz_max = np.percentile(np.abs(gt_u[2]), 99)
+    umag_max = np.percentile(np.sqrt(gt_u[0]**2 + gt_u[1]**2 + gt_u[2]**2), 99)
+    print(f"Norm: |Ux|={ux_max:.3f} |Uy|={uy_max:.3f} |Uz|={uz_max:.3f} |U|={umag_max:.3f}")
 
-    # ---- Precompute global max for normalization ----
-    # Use GT values for consistent normalization
-    gt_ux = gts[:, mask, 1]
-    gt_uy = gts[:, mask, 2]
-    gt_uz = gts[:, mask, 3]
-    ux_max = np.percentile(np.abs(gt_ux), 99)
-    uy_max = np.percentile(np.abs(gt_uy), 99)
-    uz_max = np.percentile(np.abs(gt_uz), 99)
-    umag = np.sqrt(gt_ux**2 + gt_uy**2 + gt_uz**2)
-    umag_max = np.percentile(umag, 99)
-    print(f"Normalization: |Ux|_max={ux_max:.3f}, |Uy|_max={uy_max:.3f}, "
-          f"|Uz|_max={uz_max:.3f}, |U|_max={umag_max:.3f}")
+    # 动态标签：αU vs U
+    vp = "αU" if weight_u else "U"   # velocity prefix
+    legend_text = (f"R=|{vp}x|  G=|{vp}y|  B=|{vp}z|  "
+                   f"Opacity=|{vp}|  Yellow=dir err (>90°)")
 
-    # ---- Precompute Delaunay triangulation (one-time) ----
-    from scipy.interpolate import LinearNDInterpolator
-    from scipy.spatial import Delaunay
-    print("Precomputing Delaunay triangulation...")
-    tri = Delaunay(np.column_stack([x_raw, z_raw]))
-    grid_pts = np.column_stack([grid_x.ravel(), grid_z.ravel()])
-    print(f"  Done. {len(x_raw)} source points, {len(grid_pts)} grid points")
+    speed_thresh = umag_max * 0.05
+    yellow = np.array([1.0, 0.9, 0.0])
+    xlim = (x_s.min(), x_s.max()); zlim = (z_s.min(), z_s.max())
 
-    # ---- Figure setup ----
-    bg = args.bg_color
-    fig, (ax_gt, ax_pred) = plt.subplots(2, 1, figsize=(38.4, 21.6), dpi=100)
-    fig.patch.set_facecolor(bg)
-    fig.subplots_adjust(top=0.92, bottom=0.06, left=0.05, right=0.95, hspace=0.12)
+    def frame_colors(frame):
+        """返回该帧 gt_rgb(M,3), pred_rgb(M,3, 含方向误差叠加), error_pct。"""
+        out = {}
+        for label, src in [("gt", gt_u), ("pred", pr_u)]:
+            ux, uy, uz = src[0][frame], src[1][frame], src[2][frame]
+            rgba = build_rgba_points(ux, uy, uz, ux_max, uy_max, uz_max, umag_max)
+            out[label] = composite_over_bg(rgba, bg)
 
-    extent = [x_raw.min(), x_raw.max(), z_raw.min(), z_raw.max()]
+        # 方向误差（αU 方向 = U 方向）
+        gx, gy, gz = gt_u[0][frame], gt_u[1][frame], gt_u[2][frame]
+        px, py, pz = pr_u[0][frame], pr_u[1][frame], pr_u[2][frame]
+        dot = gx*px + gy*py + gz*pz
+        gmag = np.sqrt(gx**2+gy**2+gz**2); pmag = np.sqrt(px**2+py**2+pz**2)
+        denom = gmag * pmag
+        cos_t = np.ones_like(denom)
+        nz = denom > 1e-8
+        cos_t[nz] = dot[nz] / denom[nz]      # 只在非零处除，避免 warning
+        dir_err = (cos_t < 0) & (gmag > speed_thresh) & (pmag > speed_thresh)
 
-    # Initial frame placeholder
-    dummy = np.zeros((400, 2000, 4))
-    im_gt = ax_gt.imshow(dummy, extent=extent, origin='lower', aspect='auto')
-    im_pred = ax_pred.imshow(dummy, extent=extent, origin='lower', aspect='auto')
+        pred_rgb = out["pred"].copy()
+        oa = 0.5
+        pred_rgb[dir_err] = pred_rgb[dir_err]*(1-oa) + yellow*oa
+        out["pred"] = np.clip(pred_rgb, 0, 1)
 
-    for ax, label in [(ax_gt, "Ground Truth"), (ax_pred, "HPM Prediction")]:
-        ax.set_facecolor(bg)
-        ax.set_xlabel("X (m)", fontsize=20, color='white')
-        ax.set_ylabel("Z (m)", fontsize=20, color='white')
-        ax.tick_params(labelsize=16, colors='white')
-        ax.set_title(label, fontsize=24, color='white')
+        valid = (gmag > speed_thresh)
+        err_pct = dir_err.sum() / max(valid.sum(), 1) * 100
+        return out["gt"], out["pred"], err_pct
 
-    # Legend: color key
-    legend_text = "R=|Ux|  G=|Uy|  B=|Uz|  Opacity=|U|  Yellow=direction error (>90°)"
-    fig.text(0.5, 0.97, legend_text, ha='center', fontsize=22, color='white',
-             family='monospace')
+    styles = ["tri", "scatter"] if args.style == "both" else [args.style]
+    out_base = Path(args.output)
 
-    suptitle = fig.suptitle("", fontsize=28, color='white', y=0.94)
+    for style in styles:
+        out_path = out_base.with_name(f"{out_base.stem}_{style}{out_base.suffix}")
+        print(f"[{style}] -> {out_path}")
+        fig, (ax_gt, ax_pred) = plt.subplots(2, 1, figsize=(38.4, 21.6), dpi=100)
+        fig.patch.set_facecolor(bg)
+        fig.subplots_adjust(top=0.92, bottom=0.06, left=0.05, right=0.95, hspace=0.12)
+        fig.text(0.5, 0.97, legend_text, ha='center', fontsize=22, color='white',
+                 family='monospace')
+        suptitle = fig.suptitle("", fontsize=28, color='white', y=0.94)
 
-    def interp(values):
-        """Interpolate using precomputed Delaunay triangulation."""
-        ip = LinearNDInterpolator(tri, values)
-        return ip(grid_pts).reshape(grid_x.shape)
+        def draw(ax, rgb, label):
+            ax.clear()
+            if style == "tri":
+                # 每三角形 RGB = 三顶点均值。PolyCollection 原生支持真彩色，
+                # 不绕 tripcolor 的标量映射，跨 mpl 版本最稳。
+                tri_rgb = rgb[tri_simplices].mean(axis=1)        # (T,3)
+                verts = np.stack([x_s[tri_simplices], z_s[tri_simplices]], axis=-1)  # (T,3,2)
+                pc = PolyCollection(verts, facecolors=tri_rgb, edgecolors='none')
+                ax.add_collection(pc)
+            else:
+                ax.scatter(x_s, z_s, c=rgb, s=args.point_size, edgecolors='none')
+            ax.set_facecolor(bg); ax.set_xlim(xlim); ax.set_ylim(zlim)
+            ax.set_xlabel("X (m)", fontsize=20, color='white')
+            ax.set_ylabel("Z (m)", fontsize=20, color='white')
+            ax.tick_params(labelsize=16, colors='white')
+            ax.set_title(label, fontsize=24, color='white')
 
-    def render_frame(frame):
-        """Interpolate velocity, build RGBA, overlay direction error on pred."""
-        grids = {}
-        for label, src in [("gt", gts), ("pred", preds)]:
-            ux_grid = interp(src[frame, mask, 1])
-            uy_grid = interp(src[frame, mask, 2])
-            uz_grid = interp(src[frame, mask, 3])
-            grids[label] = (ux_grid, uy_grid, uz_grid)
+        def update(frame):
+            gt_rgb, pred_rgb, err_pct = frame_colors(frame)
+            draw(ax_gt, gt_rgb, "Ground Truth")
+            draw(ax_pred, pred_rgb, "HPM Prediction")
+            gm = np.sqrt(gt_u[0][frame]**2 + gt_u[1][frame]**2 + gt_u[2][frame]**2)
+            pm = np.sqrt(pr_u[0][frame]**2 + pr_u[1][frame]**2 + pr_u[2][frame]**2)
+            rmse = np.sqrt(np.mean((gm - pm)**2))
+            suptitle.set_text(f"t={gt_times[frame]:.2f}s | Step {frame} | "
+                              f"|{vp}| RMSE={rmse:.4f} | Dir err={err_pct:.1f}%")
 
-        results = {}
-        for label in ["gt", "pred"]:
-            ux_g, uy_g, uz_g = grids[label]
-            rgba = build_rgba(ux_g, uy_g, uz_g,
-                              ux_max, uy_max, uz_max, umag_max)
+        ani = animation.FuncAnimation(fig, update, frames=n_steps,
+                                      interval=1000//args.fps, blit=False)
+        ani.save(str(out_path), writer="ffmpeg", fps=args.fps,
+                 extra_args=['-vcodec','libx264','-pix_fmt','yuv420p'])
+        plt.close()
+        print(f"[{style}] saved")
 
-            # Composite RGBA over background
-            a = rgba[:, :, 3:4]
-            rgb = rgba[:, :, :3]
-            bg_arr = np.array(bg).reshape(1, 1, 3)
-            composited = rgb * a + bg_arr * (1 - a)
-            results[label] = np.clip(composited, 0, 1)
-
-        # ---- Direction error overlay on pred ----
-        gt_ux, gt_uy, gt_uz = grids["gt"]
-        pr_ux, pr_uy, pr_uz = grids["pred"]
-
-        # Dot product: cos(theta) = (gt · pred) / (|gt| |pred|)
-        dot = gt_ux * pr_ux + gt_uy * pr_uy + gt_uz * pr_uz
-        gt_mag = np.sqrt(gt_ux**2 + gt_uy**2 + gt_uz**2)
-        pr_mag = np.sqrt(pr_ux**2 + pr_uy**2 + pr_uz**2)
-        denom = gt_mag * pr_mag
-        cos_theta = np.where(denom > 1e-8, dot / denom, 1.0)
-
-        # Direction error: cos_theta < 0 means angle > 90°
-        # Only mark where both GT and pred have significant velocity
-        speed_thresh = umag_max * 0.05  # ignore static water
-        dir_error = (cos_theta < 0) & (gt_mag > speed_thresh) & (pr_mag > speed_thresh)
-
-        # Handle NaN from griddata
-        dir_error = np.where(np.isnan(cos_theta), False, dir_error)
-
-        # Overlay yellow (1, 0.9, 0, 0.5) on pred where direction is wrong
-        yellow = np.array([1.0, 0.9, 0.0])
-        overlay_alpha = 0.5
-        pred_img = results["pred"]
-        pred_img[dir_error] = pred_img[dir_error] * (1 - overlay_alpha) + yellow * overlay_alpha
-        results["pred"] = np.clip(pred_img, 0, 1)
-
-        # Count direction error percentage
-        valid = (gt_mag > speed_thresh) & (~np.isnan(cos_theta))
-        n_error = dir_error.sum()
-        n_valid = valid.sum()
-        error_pct = (n_error / max(n_valid, 1)) * 100
-
-        # Transpose for imshow: (Nx, Nz, 3) -> (Nz, Nx, 3)
-        results["gt"] = results["gt"].transpose(1, 0, 2)
-        results["pred"] = results["pred"].transpose(1, 0, 2)
-
-        return results, error_pct
-
-    def update(frame):
-        rendered, error_pct = render_frame(frame)
-        im_gt.set_data(rendered["gt"])
-        im_pred.set_data(rendered["pred"])
-
-        # RMSE on velocity magnitude
-        gt_umag = np.sqrt(gts[frame, mask, 1]**2 + gts[frame, mask, 2]**2 +
-                          gts[frame, mask, 3]**2)
-        pred_umag = np.sqrt(preds[frame, mask, 1]**2 + preds[frame, mask, 2]**2 +
-                            preds[frame, mask, 3]**2)
-        rmse = np.sqrt(np.mean((gt_umag - pred_umag)**2))
-
-        suptitle.set_text(
-            f"t = {gt_times[frame]:.2f}s | Step {frame} | "
-            f"|U| RMSE = {rmse:.4f} | Dir err = {error_pct:.1f}%")
-        return im_gt, im_pred, suptitle
-
-    print(f"Generating animation: {n_steps} frames...")
-    ani = animation.FuncAnimation(fig, update, frames=n_steps,
-                                  interval=1000 // args.fps, blit=False)
-    ani.save(args.output, writer="ffmpeg", fps=args.fps,
-             extra_args=['-vcodec', 'libx264', '-pix_fmt', 'yuv420p'])
-    plt.close()
-
-    # RMSE summary
-    rmse_per_step = []
-    for f in range(n_steps):
-        gt_u = np.sqrt(gts[f, :, 1]**2 + gts[f, :, 2]**2 + gts[f, :, 3]**2)
-        pred_u = np.sqrt(preds[f, :, 1]**2 + preds[f, :, 2]**2 + preds[f, :, 3]**2)
-        rmse_per_step.append(np.sqrt(np.mean((gt_u - pred_u)**2)))
-    rmse_arr = np.array(rmse_per_step)
-    print(f"|U| RMSE: start={rmse_arr[0]:.4f}, end={rmse_arr[-1]:.4f}, mean={rmse_arr.mean():.4f}")
-
-    rmse_path = Path(args.output).with_suffix(".npy")
-    np.save(rmse_path, rmse_arr)
-    print(f"Saved: {args.output}")
+    # |U| RMSE summary (全场)
+    rmse_arr = np.array([
+        np.sqrt(np.mean((np.sqrt(gts[f,:,1]**2+gts[f,:,2]**2+gts[f,:,3]**2)
+                       - np.sqrt(preds[f,:,1]**2+preds[f,:,2]**2+preds[f,:,3]**2))**2))
+        for f in range(n_steps)])
+    print(f"|{vp}| RMSE: start={rmse_arr[0]:.4f} end={rmse_arr[-1]:.4f} mean={rmse_arr.mean():.4f}")
+    np.save(out_base.with_suffix(".npy"), rmse_arr)
+    print("Done.")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ except ImportError:
     HAS_WANDB = False
 
 from hpm_model import HPM
-from dataset import WaveDataset, compute_stats, load_coords
+from dataset import WaveDataset, compute_stats, load_coords, stats_filename, expand_range
 
 
 # ============================================================
@@ -36,45 +36,22 @@ from dataset import WaveDataset, compute_stats, load_coords
 # ============================================================
 
 class WeightedMSELoss(nn.Module):
-    """Per-channel weighted MSE with optional phase-gate weighting.
+    """Per-channel weighted MSE.
 
     Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]
-
-    When use_phase_gate is True, U (1,2,3) and nut (5) loss is weighted by
-    gate = sigmoid(k*(alpha_gt - alpha_0)) — air-phase (low alpha) contributions
-    are suppressed, consistent with the forward-pass gating. alpha and p_rgh
-    keep full weight.
+    Weights: alpha+U at 1.0, p_rgh+nut at 0.1.
     """
 
-    def __init__(self, weights=None, use_phase_gate=False,
-                 gate_alpha_0=0.1, gate_k=30.0):
+    def __init__(self, weights=None):
         super().__init__()
         if weights is None:
             weights = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1]
         self.register_buffer('weights', torch.tensor(weights, dtype=torch.float32))
-        self.use_phase_gate = use_phase_gate
-        self.gate_alpha_0 = gate_alpha_0
-        self.gate_k = gate_k
-        # channels to gate: U (1,2,3) and nut (5)
-        gate_mask = torch.zeros(6)
-        gate_mask[[1, 2, 3, 5]] = 1.0
-        self.register_buffer('gate_channel_mask', gate_mask)
 
-    def forward(self, pred, target, alpha_gt=None):
+    def forward(self, pred, target):
         mse = (pred - target) ** 2                     # (B, N, F)
         w = self.weights[None, None, :]                # (1, 1, F)
-
-        if self.use_phase_gate and alpha_gt is not None:
-            # gate weight from GT alpha (clean signal during training)
-            gate = torch.sigmoid(self.gate_k * (alpha_gt - self.gate_alpha_0))  # (B, N, 1)
-            cmask = self.gate_channel_mask[None, None, :]  # (1, 1, F)
-            # gated channels: weight *= gate; others: weight unchanged
-            gate_w = (1 - cmask) + cmask * gate         # (B, N, F)
-            weighted = mse * w * gate_w
-        else:
-            weighted = mse * w
-
-        return weighted.mean()
+        return (mse * w).mean()
 
 
 # ============================================================
@@ -113,11 +90,8 @@ def multistep_rollout_loss(model, coords, window_fields, future_frames,
         gt_frame = future_frames[:, step]                      # (B, N, F)
         gt_delta = gt_frame - current_frame                    # (B, N, F)
 
-        # GT alpha (channel 0) for phase-gate loss weighting
-        alpha_gt = gt_frame[:, :, 0:1]                         # (B, N, 1)
-
         # Loss for this step
-        total_loss = total_loss + criterion(delta_pred, gt_delta, alpha_gt)
+        total_loss = total_loss + criterion(delta_pred, gt_delta)
 
         # Predicted next frame (detach-free — gradients flow through all steps)
         pred_frame = current_frame + delta_pred                # (B, N, F)
@@ -215,20 +189,36 @@ def main(cfg: DictConfig):
     print(f"Loaded LBO eigenvectors: {spectral_embedding.shape}")
 
     # ---- Stats ----
-    stats_path = Path(cfg.data.dir) / "stats.npy"
+    # alpha-weighting changes field distributions, so stats are version-specific.
+    # Each (weight_u, weight_nut) combo uses its own stats_u{0|1}_nut{0|1}.npy,
+    # auto-selected — no manual deletion needed.
+    weight_u_by_alpha = cfg.data.get('weight_u_by_alpha', True)
+    weight_nut_by_alpha = cfg.data.get('weight_nut_by_alpha', False)
+    train_chunks = expand_range(cfg.data.train_chunk_range)
+    val_chunks = expand_range(cfg.data.val_chunk_range)
+    print(f"Train chunks: {train_chunks}, Val chunks: {val_chunks}")
+    print(f"Alpha-weighting: U={weight_u_by_alpha}, nut={weight_nut_by_alpha}")
+    stats_path = Path(cfg.data.dir) / stats_filename(
+        train_chunks, weight_u=weight_u_by_alpha, weight_nut=weight_nut_by_alpha)
     if not stats_path.exists():
-        print("Computing dataset statistics from training chunks...")
-        stats = compute_stats(cfg.data.dir, cfg.data.train_chunks)
+        print(f"Computing dataset statistics -> {stats_path.name}")
+        stats = compute_stats(cfg.data.dir, train_chunks,
+                              weight_u=weight_u_by_alpha,
+                              weight_nut=weight_nut_by_alpha)
     else:
         stats = np.load(stats_path)
-        print(f"Loaded stats: mean={stats[0]}, std={stats[1]}")
+        print(f"Loaded {stats_path.name}: mean={stats[0]}, std={stats[1]}")
 
     # ---- Dataset ----
     rollout_steps = cfg.train.get('rollout_steps', 4)
-    train_set = WaveDataset(cfg.data.dir, cfg.data.train_chunks, cfg.data.window,
-                            stats, rollout_steps=rollout_steps)
-    val_set = WaveDataset(cfg.data.dir, cfg.data.val_chunks, cfg.data.window,
-                          stats, rollout_steps=rollout_steps)
+    train_set = WaveDataset(cfg.data.dir, train_chunks, cfg.data.window,
+                            stats, rollout_steps=rollout_steps,
+                            weight_u_by_alpha=weight_u_by_alpha,
+                            weight_nut_by_alpha=weight_nut_by_alpha)
+    val_set = WaveDataset(cfg.data.dir, val_chunks, cfg.data.window,
+                          stats, rollout_steps=rollout_steps,
+                          weight_u_by_alpha=weight_u_by_alpha,
+                          weight_nut_by_alpha=weight_nut_by_alpha)
     print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}")
     print(f"Rollout steps: {rollout_steps}")
 
@@ -257,10 +247,6 @@ def main(cfg: DictConfig):
         spectral_embedding=spectral_embedding,
         use_ckpt=cfg.model.use_ckpt,
         max_grad_norm=cfg.train.max_grad_norm,
-        use_phase_gate=cfg.model.get('use_phase_gate', False),
-        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.5),
-        gate_k_init=cfg.model.get('gate_k_init', 10.0),
-        stats=stats,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -273,11 +259,7 @@ def main(cfg: DictConfig):
         optimizer, max_lr=cfg.train.lr, epochs=cfg.train.epochs,
         steps_per_epoch=len(train_loader), pct_start=0.1
     )
-    criterion = WeightedMSELoss(
-        use_phase_gate=cfg.model.get('use_phase_gate', False),
-        gate_alpha_0=cfg.model.get('gate_alpha_0', 0.1),
-        gate_k=cfg.model.get('gate_k_init', 30.0),
-    ).to(device)
+    criterion = WeightedMSELoss().to(device)
 
     # ---- Resume ----
     start_epoch = 0

@@ -32,4 +32,4 @@ echo "========================================"
 # Train — all config from config.yaml
 # Override via command line: python train.py model.n_hidden=128
 # ============================================================
-python -u train.py
+python -u train.py data.weight_u_by_alpha=true wandb.name=hpm_flux_u_h128

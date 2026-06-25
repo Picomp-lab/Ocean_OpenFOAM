@@ -1,30 +1,42 @@
 data:
   dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05
-  train_chunks: [1, 2, 3, 4, 5, 6, 7]
-  val_chunks: [8, 9]
+  # chunk range: [single] or [start,end]
+  train_chunk_range: [1, 7]
+  val_chunk_range: [8]
+  test_chunk_range: [9]
   window: 6
+  # Alpha-weighting (momentum-density-like). Each version uses its OWN
+  # stats file: stats_u{0|1}_nut{0|1}.npy (auto-selected). No manual deletion.
+  #   weight_u_by_alpha:   True = alpha*U (alpha-U model), False = raw U (single-U model)
+  #   weight_nut_by_alpha: ablation switch for nut
+  weight_u_by_alpha: false
+  weight_nut_by_alpha: false
 
 model:
-  n_hidden: 64
-  n_layers: 4
+  n_hidden: 128
+  n_layers: 6
   n_heads: 8
   freq_num: 64
-  dropout: 0.0
-  mlp_ratio: 1
+  dropout: 0.1
+  mlp_ratio: 2
   spectral_pos_dim: 0
   use_ckpt: true
-  use_phase_gate: true
-  gate_alpha_0: 0.4
-  gate_k_init: 40.0
 
 train:
   batch_size: 1
-  lr: 1e-4
-  weight_decay: 1e-5
+  lr: 5e-4
+  weight_decay: 1e-4
   epochs: 50
-  max_grad_norm: 0.1
+  max_grad_norm: 1.0
   num_workers: 4
   rollout_steps: 4
+
+hydra:
+  run:
+    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
 
 save:
   dir: ${hydra:runtime.output_dir}/checkpoints
@@ -32,4 +44,4 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  name: hpm_gated_a04_k40
+  name: hpm_bl_h128

@@ -15,11 +15,11 @@ conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
 # ============================================================
 # Paths — update these after training finishes
 # ============================================================
-TIMEPOINT = "2026-06-18/21-54-18"
-CONFIG="outputs/$TIMEPOINT/.hydra/config.yaml"  # <-- fill in after training
-CKPT="outputs/$TIMEPOINT/checkpoints/best.pt"   # <-- fill in after training
+TIMEPOINT="2026-06-23/00-02-27"
+CONFIG="outputs/$TIMEPOINT/.hydra/config.yaml"
+CKPT="outputs/$TIMEPOINT/checkpoints/best.pt"
 DATA=~/hpc-share/models/data/3d/cropped_0.05
-FEATURE="k128"
+FEATURE="flux_u"
 
 echo "========================================"
 echo "HPM Inference & Visualization"
@@ -31,8 +31,20 @@ echo "Node:   $(hostname)"
 echo "Date:   $(date)"
 echo "========================================"
 
+# ---- 覆盖保护：FEATURE 目录已有内容则终止（FORCE=1 可强制覆盖）----
+if [ -d "vis/${FEATURE}" ] && [ -n "$(ls -A "vis/${FEATURE}" 2>/dev/null)" ]; then
+    if [ "$FORCE" != "1" ]; then
+        echo "ERROR: vis/${FEATURE}/ 已有内容，继续将覆盖已有结果。"
+        echo "  - 要覆盖: FORCE=1 sbatch vis.sh"
+        echo "  - 或换名: 修改 FEATURE 变量"
+        exit 1
+    fi
+    echo "WARN: FORCE=1，将覆盖 vis/${FEATURE}/ 已有内容"
+fi
+
 declare -A FIELDS=( [0]=alpha [1]=ux [2]=uy [3]=uz [4]=prgh [5]=nut )
 
+# style=both -> 每个 field×chunk 产出 *_scatter.mp4 和 *_tri.mp4 两个视频
 for FIELD in 0 4 5; do
     NAME=${FIELDS[$FIELD]}
     OUTPUT="vis/${FEATURE}/${NAME}"
@@ -46,11 +58,15 @@ for FIELD in 0 4 5; do
             --data_dir "$DATA" \
             --chunk_id "$CHUNK" \
             --n_frames 93 \
+            --style both \
             --output "${OUTPUT}/compare_chunk${CHUNK}_${NAME}.mp4" \
             --field "$FIELD"
     done
 done
 
+# ============================================================
+# RGB velocity (αU/U space, tri+scatter)
+# ============================================================
 OUTPUT="vis/${FEATURE}/U"
 mkdir -p "$OUTPUT"
 for CHUNK in 6 9; do
@@ -60,7 +76,9 @@ for CHUNK in 6 9; do
         --data_dir "$DATA" \
         --chunk_id "$CHUNK" \
         --n_frames 93 \
+        --style both \
         --output "${OUTPUT}/compare_chunk${CHUNK}_u.mp4"
+done
 
 echo ""
 echo "Done: $(date)"
