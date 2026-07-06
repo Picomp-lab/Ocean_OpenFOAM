@@ -15,11 +15,11 @@ conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
 # ============================================================
 # Paths — update these after training finishes
 # ============================================================
-TIMEPOINT="2026-06-23/00-02-27"
+TIMEPOINT="hpm_flux_u_h128/2026-06-25_07-10-27"
 CONFIG="outputs/$TIMEPOINT/.hydra/config.yaml"
 CKPT="outputs/$TIMEPOINT/checkpoints/best.pt"
 DATA=~/hpc-share/models/data/3d/cropped_0.05
-FEATURE="flux_u"
+FEATURE="flux_u_h128"
 
 echo "========================================"
 echo "HPM Inference & Visualization"
