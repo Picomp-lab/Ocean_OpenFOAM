@@ -2,10 +2,14 @@
 GT vs HPM Prediction animation — vertically stacked, PyVista-slice based.
 Top: Ground Truth, Bottom: Prediction.
 
-全程 αU/U 空间（不还原），与训练一致：
-  - 从 config 读 weight_u_by_alpha / weight_nut_by_alpha
-  - rollout 输入和 GT 都经 apply_alpha_weighting 同样变换
-  - 自动选版本 stats: stats_u{0|1}_nut{0|1}.npy
+Schema-driven（见 schema.py）：
+  - 通道集合 / alpha-weighting / stats 文件名全部来自 checkpoint 的 config
+    （旧 config 无 channels 键 -> 自动 legacy 6 通道 fallback，仍可可视化旧模型）
+  - rollout 闭合用共享 advance_window，与训练完全同一份代码
+  - --field 按名传参：alpha / Ux / Uy / Uz / p_rgh / nut / Umag（|U| 特判）
+    索引语义漂移问题从根上消灭。
+
+全程 αU/U 空间（不还原），与训练一致。
 切片几何来自预计算缓存 (slice_y0.30/)，运行时纯 numpy，不依赖 pyvista。
 --style both 输出 {output}_scatter.mp4 和 {output}_tri.mp4。
 """
@@ -23,14 +27,17 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from hpm_model import HPM
-from dataset import load_coords, apply_alpha_weighting, stats_filename, expand_range
+from schema import ChannelSchema, advance_window
+from dataset import load_coords, load_chunk, resolve_stats, expand_range
 
 MID_Y = 0.30
 
 
 @torch.no_grad()
-def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps, device):
-    """data_w 已是 alpha-weighted（与训练同空间）。输出同空间，不还原。"""
+def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps,
+            device, schema):
+    """data_w 已是 schema 选列 + alpha-weighted（与训练同空间）。输出同空间，不还原。
+    窗口滑动 / frozen 通道处理全部由共享 advance_window 完成（与训练零漂移）。"""
     mean, std = stats[0], stats[1]
     normalize = lambda x: (x - mean) / std
     denormalize = lambda x: x * std + mean
@@ -43,11 +50,9 @@ def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps, dev
     coords_batch = coords_norm.unsqueeze(0)
 
     for step in range(n_steps):
-        delta = model(coords_batch, fields_w)
-        pred_norm = fields_w[0, :, -6:] + delta[0]
-        pred_np = denormalize(pred_norm.cpu().numpy())
-        predictions.append(pred_np)
-        fields_w = torch.cat([fields_w[..., 6:], pred_norm.unsqueeze(0)], dim=-1)
+        delta = model(coords_batch, fields_w)               # (1, N, out_dim)
+        pred_frame, fields_w = advance_window(fields_w, delta, schema)
+        predictions.append(denormalize(pred_frame[0].cpu().numpy()))
 
     return np.stack(predictions)
 
@@ -60,8 +65,9 @@ def main():
     parser.add_argument("--chunk_id", type=int, required=True)
     parser.add_argument("--start_frame", type=int, default=6)
     parser.add_argument("--n_frames", type=int, default=93)
-    parser.add_argument("--field", type=int, default=0,
-                        help="0=alpha,1=Ux,2=Uy,3=Uz,4=p_rgh,5=nut,6=|U|")
+    parser.add_argument("--field", type=str, default="alpha",
+                        help="channel NAME (e.g. alpha, Ux, p_rgh, nut) "
+                             "or 'Umag' for |U|. Must exist in the model's schema.")
     parser.add_argument("--output", type=str, default="compare.mp4")
     parser.add_argument("--style", type=str, default="both",
                         choices=["scatter", "tri", "both"])
@@ -72,21 +78,20 @@ def main():
 
     data_dir = Path(args.data_dir)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    fi = args.field
 
     # ---- Load model + config ----
     print("Loading model...")
     cfg = OmegaConf.load(args.config_path)
+    schema = ChannelSchema.from_cfg(cfg)
+    print(schema.describe())
     spectral_embedding = np.load(data_dir / "lbo" / "lbo_eigenvectors.npy")
 
-    # alpha-weighting flags (from this model's config) -> 选对应版本 stats
-    weight_u = cfg.data.get('weight_u_by_alpha', True)
-    weight_nut = cfg.data.get('weight_nut_by_alpha', False)
     train_chunks = expand_range(cfg.data.train_chunk_range)
-    stats = np.load(data_dir / stats_filename(train_chunks, weight_u=weight_u, weight_nut=weight_nut))
+    stats = resolve_stats(data_dir, train_chunks, schema)
 
     model = HPM(
-        space_dim=3, field_dim=6, out_dim=6,
+        field_dim=schema.field_dim, out_dim=schema.out_dim,
+        space_dim=3,
         window=cfg.data.window,
         n_hidden=cfg.model.n_hidden,
         n_layers=cfg.model.n_layers,
@@ -103,22 +108,36 @@ def main():
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    # ---- Load data ----
+    # ---- Resolve --field against schema (name-based, no magic indices) ----
+    disp = schema.display_names()
+    if args.field == "Umag":
+        for c in ("Ux", "Uy", "Uz"):
+            assert c in schema.names, \
+                f"'Umag' requires channel '{c}' in schema {schema.names}"
+        iu = [schema.names.index(c) for c in ("Ux", "Uy", "Uz")]
+        vp = "αU" if schema.alpha_weighted[iu[0]] else "U"
+        fname = f"|{vp}|"
+        fi = None
+    else:
+        assert args.field in schema.names, (
+            f"--field '{args.field}' not in this model's channels "
+            f"{list(schema.names)} (or use 'Umag')")
+        fi = schema.names.index(args.field)
+        fname = disp[fi]
+
+    # ---- Load data (schema 选列 + alpha-weighting，与训练同空间) ----
     print("Loading data...")
-    raw = np.load(data_dir / f"chunk_{args.chunk_id:03d}_data.npy")
+    data_w = load_chunk(data_dir, args.chunk_id, schema)
     times = np.load(data_dir / f"chunk_{args.chunk_id:03d}_times.npy")
     coords_norm = load_coords(args.data_dir).to(device)
-
-    # ---- alpha-weighting：与训练同空间（不还原）----
-    print(f"Alpha-weighting: U={weight_u}, nut={weight_nut}")
-    data_w = apply_alpha_weighting(raw, weight_u=weight_u, weight_nut=weight_nut)
 
     W = cfg.data.window
     start = max(args.start_frame, W - 1)
     n_steps = min(args.n_frames, data_w.shape[0] - start - 1)
 
     print(f"Rolling out {n_steps} steps from frame {start}...")
-    preds = rollout(model, coords_norm, data_w, stats, W, start, n_steps, device)
+    preds = rollout(model, coords_norm, data_w, stats, W, start, n_steps,
+                    device, schema)
     gts = data_w[start + 1: start + 1 + n_steps]
     gt_times = times[start + 1: start + 1 + n_steps]
 
@@ -130,28 +149,19 @@ def main():
     print(f"Slice cache: {len(cell_map)} faces @ y={MID_Y}")
     x_s, z_s = xz[:, 0], xz[:, 1]
 
-    # ---- field 标签随 weight_u / weight_nut 动态 ----
-    if weight_u:
-        field_names = ["alpha.water", "alphaUx", "alphaUy", "alphaUz", "p_rgh", "nut", "|alphaU|"]
-    else:
-        field_names = ["alpha.water", "Ux", "Uy", "Uz", "p_rgh", "nut", "|U|"]
-    if weight_nut:
-        field_names[5] = "alpha*nut"
-    fname = field_names[fi]
-
-    if fi == 6:
-        gt_slice = np.sqrt(gts[:, cell_map, 1]**2 + gts[:, cell_map, 2]**2 + gts[:, cell_map, 3]**2)
-        pred_slice = np.sqrt(preds[:, cell_map, 1]**2 + preds[:, cell_map, 2]**2 + preds[:, cell_map, 3]**2)
+    if fi is None:  # Umag
+        gt_slice = np.sqrt(sum(gts[:, cell_map, i] ** 2 for i in iu))
+        pred_slice = np.sqrt(sum(preds[:, cell_map, i] ** 2 for i in iu))
     else:
         gt_slice = gts[:, cell_map, fi]
         pred_slice = preds[:, cell_map, fi]
 
-    # ---- colormap + range ----
-    if fi == 0:
+    # ---- colormap + range (按名判定，不再依赖魔法索引) ----
+    if args.field == "alpha":
         cdict = {'red':[[0.,1.,1.],[1.,.6,.6]], 'green':[[0.,1.,1.],[1.,0.,0.]], 'blue':[[0.,1.,1.],[1.,0.,0.]]}
         custom_cmap = LinearSegmentedColormap('OpacityReds', cdict)
         vmin, vmax = 0.0, 1.0
-    elif fi == 6:
+    elif args.field == "Umag":
         custom_cmap = 'magma'
         av = np.concatenate([gt_slice.ravel(), pred_slice.ravel()])
         vmin, vmax = 0.0, np.percentile(av, 99)
@@ -207,7 +217,8 @@ def main():
     print(f"slice-RMSE: start={rmse_slice[0]:.4f} end={rmse_slice[-1]:.4f} mean={rmse_slice.mean():.4f}")
     rmse_full = np.sqrt(((gts-preds)**2).mean(axis=1))
     np.save(out_base.with_suffix(".npy"), rmse_full)
-    print(f"full-field RMSE saved: {out_base.with_suffix('.npy')}")
+    print(f"full-field RMSE saved: {out_base.with_suffix('.npy')} "
+          f"(columns = {list(schema.names)})")
     print("Done.")
 
 

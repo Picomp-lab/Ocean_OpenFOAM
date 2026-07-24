@@ -1,6 +1,10 @@
 """
 Dataset for HPM time-stepping prediction with multi-step rollout support.
 
+Schema-driven: all channel selection, alpha-weighting and stats naming come
+from ChannelSchema (schema.py). Disk files stay 6-channel; channels are
+selected BY NAME at load time — no data regeneration for ablations.
+
 Returns temporal window + R consecutive future frames for multi-step loss.
 Coords are NOT returned per-sample — use load_coords() separately.
 Data stored as torch.Tensor for shared memory with DataLoader workers.
@@ -8,10 +12,10 @@ Data stored as torch.Tensor for shared memory with DataLoader workers.
 Data layout on disk:
     data_dir/
         coords.npy              # (N, 3) float32
-        chunk_000_data.npy      # (T_chunk, N, 6) float32
+        chunk_000_data.npy      # (T_chunk, N, 6) float32 — DISK_CHANNELS order
         chunk_000_times.npy     # (T_chunk,) float64
         ...
-        stats.npy               # (2, 6) float32 — [mean, std] per channel
+        stats_{tag}_{signature}.npy   # (2, field_dim) — [mean, std] per channel
         lbo/
             lbo_eigenvectors.npy  # (N, K) float32
             lbo_eigenvalues.npy   # (K,) float32
@@ -22,32 +26,12 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 
+from schema import ChannelSchema, DISK_CHANNELS
 
-def apply_alpha_weighting(data, weight_u=True, weight_nut=False):
-    """Multiply velocity (and optionally nut) by alpha (water fraction) IN PLACE
-    of the raw fields, in PHYSICAL space (before normalization).
 
-    Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]
-      - U (1,2,3): weighted -> alpha*U if weight_u=True (momentum-density-like)
-      - nut (5):   weighted -> alpha*nut only if weight_nut=True
-      - alpha (0), p_rgh (4): left untouched
-
-    NOTE: This changes the field distributions, so stats.npy MUST be recomputed
-    whenever weight_nut changes. Do not reuse stats across different settings.
-
-    Args:
-        data: (..., 6) array, raw physical fields (alpha in [0,1])
-    Returns:
-        (..., 6) array with alpha-weighting applied (new array; input not mutated)
-    """
-    out = data.copy()
-    alpha = data[..., 0:1]          # physical alpha in [0,1]
-    if weight_u:
-        out[..., 1:4] = data[..., 1:4] * alpha       # U -> alpha*U
-    if weight_nut:
-        out[..., 5:6] = data[..., 5:6] * alpha       # nut -> alpha*nut
-    return out
-
+# ============================================================
+# Chunk range helpers (unchanged)
+# ============================================================
 
 def expand_range(r):
     """Chunk range spec -> explicit chunk list.
@@ -74,50 +58,130 @@ def chunk_tag(chunk_ids):
     return f"c{ids[0]}-{ids[-1]}"
 
 
-def stats_filename(chunk_ids, weight_u=True, weight_nut=False):
-    """Version-specific stats filename:
-    stats_c{tag}_u{0|1}_nut{0|1}.npy  (tag = c8 or c1-7).
-    Encodes train-chunk set + alpha-weighting so different settings never collide."""
-    tag = chunk_tag(chunk_ids)
-    return f"stats_{tag}_u{int(bool(weight_u))}_nut{int(bool(weight_nut))}.npy"
+# ============================================================
+# Channel-aware loading + alpha-weighting
+# ============================================================
 
+def load_chunk(data_dir, cid, schema):
+    """Load one chunk, select schema channels by name, apply alpha-weighting.
 
-def compute_stats(data_dir, chunk_ids, weight_u=True, weight_nut=False):
-    """Compute per-channel mean and std from specified chunks (training set only).
-
-    Stats are computed on the alpha-weighted fields (U and optionally nut),
-    matching what _build_samples feeds the model.
+    Returns (T, N, field_dim) float array in the SAME physical space the
+    model trains in (alpha-weighted where schema says so).
     """
+    data_dir = Path(data_dir)
+    data = np.load(data_dir / f"chunk_{cid:03d}_data.npy")   # (T, N, 6)
+    assert data.shape[-1] == len(DISK_CHANNELS), (
+        f"chunk_{cid:03d}_data.npy has {data.shape[-1]} channels, expected "
+        f"{len(DISK_CHANNELS)} ({DISK_CHANNELS}) — disk layout mismatch")
+    data = data[..., schema.disk_indices]                     # select by name
+    return apply_alpha_weighting(data, schema)
+
+
+def apply_alpha_weighting(data, schema):
+    """Multiply alpha_weighted channels by alpha (water fraction) in PHYSICAL
+    space (before normalization). alpha channel located BY NAME via schema.
+
+    Args:
+        data: (..., field_dim) array in schema channel order, alpha in [0,1]
+    Returns:
+        new array with alpha-weighting applied (input not mutated)
+    """
+    assert data.shape[-1] == schema.field_dim, (
+        f"data has {data.shape[-1]} channels, schema expects "
+        f"{schema.field_dim} ({schema.names})")
+    out = data.copy()
+    alpha = data[..., schema.alpha_idx:schema.alpha_idx + 1]  # (..., 1)
+    for i, w in enumerate(schema.alpha_weighted):
+        if w:
+            out[..., i:i + 1] = data[..., i:i + 1] * alpha
+    return out
+
+
+# ============================================================
+# Stats — versioned by chunk set + channel signature
+# ============================================================
+
+def stats_filename(chunk_ids, schema):
+    """stats_{tag}_{signature}.npy — encodes train-chunk set + channel set +
+    alpha-weighting, so different settings can never collide."""
+    return f"stats_{chunk_tag(chunk_ids)}_{schema.signature()}.npy"
+
+
+def _legacy_stats_filename(chunk_ids, schema):
+    """Old naming (pre-schema): stats_{tag}_u{0|1}_nut{0|1}.npy.
+    Only meaningful for the exact legacy 6-channel layout."""
+    wu = int(schema.alpha_weighted[schema.names.index("Ux")])
+    wn = int(schema.alpha_weighted[schema.names.index("nut")])
+    return f"stats_{chunk_tag(chunk_ids)}_u{wu}_nut{wn}.npy"
+
+
+def compute_stats(data_dir, chunk_ids, schema):
+    """Compute per-channel mean/std from specified chunks (training set only),
+    on the alpha-weighted, schema-selected fields — matching what the model
+    is fed. Saves under the versioned filename and returns the array."""
     data_dir = Path(data_dir)
     running_sum = None
     running_sq_sum = None
     total_count = 0
 
     for cid in chunk_ids:
-        data = np.load(data_dir / f"chunk_{cid:03d}_data.npy")  # (T, N, 6)
-        data = apply_alpha_weighting(data, weight_u=weight_u, weight_nut=weight_nut)
+        data = load_chunk(data_dir, cid, schema)              # (T, N, C)
         T, N, C = data.shape
-        n = T * N
-
+        flat = data.reshape(-1, C).astype(np.float64)
         if running_sum is None:
             running_sum = np.zeros(C, dtype=np.float64)
             running_sq_sum = np.zeros(C, dtype=np.float64)
-
-        flat = data.reshape(-1, C).astype(np.float64)
         running_sum += flat.sum(axis=0)
         running_sq_sum += (flat ** 2).sum(axis=0)
-        total_count += n
+        total_count += T * N
 
     mean = running_sum / total_count
     std = np.sqrt(running_sq_sum / total_count - mean ** 2)
     std = np.maximum(std, 1e-8)
 
-    stats = np.stack([mean, std], axis=0).astype(np.float32)  # (2, 6)
-    fname = stats_filename(chunk_ids, weight_u=weight_u, weight_nut=weight_nut)
+    stats = np.stack([mean, std], axis=0).astype(np.float32)  # (2, C)
+    fname = stats_filename(chunk_ids, schema)
     np.save(data_dir / fname, stats)
     print(f"Saved {fname}: mean={mean}, std={std}")
     return stats
 
+
+def resolve_stats(data_dir, chunk_ids, schema, verbose=True):
+    """Load stats if present, else compute. Resolution order:
+      1. new versioned name  stats_{tag}_{signature}.npy
+      2. legacy name         stats_{tag}_u{0|1}_nut{0|1}.npy
+         (read-only fallback; only if schema is the exact legacy layout —
+         numerically identical, avoids recomputation for old runs)
+      3. compute from chunks
+    Always validates shape against schema.field_dim (catches stale files)."""
+    data_dir = Path(data_dir)
+
+    new_path = data_dir / stats_filename(chunk_ids, schema)
+    if new_path.exists():
+        stats = np.load(new_path)
+        if verbose:
+            print(f"Loaded {new_path.name}: mean={stats[0]}, std={stats[1]}")
+    elif schema.is_legacy_layout() and \
+            (data_dir / _legacy_stats_filename(chunk_ids, schema)).exists():
+        legacy_path = data_dir / _legacy_stats_filename(chunk_ids, schema)
+        stats = np.load(legacy_path)
+        if verbose:
+            print(f"Loaded legacy stats {legacy_path.name} "
+                  f"(identical computation, old naming)")
+    else:
+        if verbose:
+            print(f"Computing dataset statistics -> {new_path.name}")
+        stats = compute_stats(data_dir, chunk_ids, schema)
+
+    assert stats.shape == (2, schema.field_dim), (
+        f"stats shape {stats.shape} != (2, {schema.field_dim}) — stale stats "
+        f"file for a different channel set? Delete and recompute.")
+    return stats
+
+
+# ============================================================
+# Coords
+# ============================================================
 
 def load_coords(data_dir):
     """Load and normalize coordinates. Call once, send to GPU outside loop."""
@@ -130,45 +194,41 @@ def load_coords(data_dir):
     return torch.from_numpy(coords_norm)  # (N, 3)
 
 
+# ============================================================
+# Dataset
+# ============================================================
+
 class WaveDataset(Dataset):
     """
     Dataset yielding (window_fields, future_frames) tuples.
 
     Each sample:
-        window_fields: (N, W*6) float32 — W consecutive normalized frames, flattened
-        future_frames: (R, N, 6) float32 — R future frames (normalized, absolute values)
+        window_fields: (N, W*F) float32 — W consecutive normalized frames, flattened
+        future_frames: (R, N, F) float32 — R future frames (normalized, absolute)
 
-    During training, the loss function handles:
-      - Autoregressive rollout for R steps
-      - Delta computation (residual learning) at each step
-      - Accumulation of per-step losses
+    F = schema.field_dim. The loss function handles rollout, delta computation
+    and per-step accumulation (via schema.advance_window).
 
     Args:
+        schema:        ChannelSchema — channel selection / weighting / naming
+        stats:         (2, F) [mean, std]; if None, resolved via resolve_stats
         rollout_steps: number of future frames to return (default 4)
     """
 
-    def __init__(self, data_dir, chunk_ids, window=6, stats=None, rollout_steps=4,
-                 weight_u_by_alpha=True, weight_nut_by_alpha=False):
+    def __init__(self, data_dir, chunk_ids, window, schema, stats=None,
+                 rollout_steps=4):
         super().__init__()
+        assert isinstance(schema, ChannelSchema), \
+            "WaveDataset now requires a ChannelSchema (see schema.py)"
         self.data_dir = Path(data_dir)
         self.window = window
+        self.schema = schema
         self.rollout_steps = rollout_steps
-        self.weight_u_by_alpha = weight_u_by_alpha
-        self.weight_nut_by_alpha = weight_nut_by_alpha
         self.N = np.load(self.data_dir / "coords.npy").shape[0]
 
-        # Load or compute stats
-        if stats is not None:
-            self.stats = stats
-        else:
-            stats_path = self.data_dir / stats_filename(
-                chunk_ids, weight_u=weight_u_by_alpha, weight_nut=weight_nut_by_alpha)
-            if stats_path.exists():
-                self.stats = np.load(stats_path)
-            else:
-                self.stats = compute_stats(self.data_dir, chunk_ids,
-                                           weight_u=weight_u_by_alpha,
-                                           weight_nut=weight_nut_by_alpha)
+        if stats is None:
+            stats = resolve_stats(self.data_dir, chunk_ids, schema)
+        self.stats = stats
         self.mean = self.stats[0]
         self.std = self.stats[1]
 
@@ -179,9 +239,7 @@ class WaveDataset(Dataset):
     def _build_samples(self, chunk_ids):
         """Load chunks as torch tensors and build sample index."""
         for cid in chunk_ids:
-            data = np.load(self.data_dir / f"chunk_{cid:03d}_data.npy")  # (T, N, 6)
-            data = apply_alpha_weighting(data, weight_u=self.weight_u_by_alpha,
-                                         weight_nut=self.weight_nut_by_alpha)
+            data = load_chunk(self.data_dir, cid, self.schema)  # (T, N, F)
             data_norm = ((data - self.mean) / self.std).astype(np.float32)
             # .clone() detaches from numpy memory, .share_memory_() makes
             # it safe for multi-worker DataLoader (avoids CoW on fork)
@@ -201,12 +259,12 @@ class WaveDataset(Dataset):
         chunk = self.chunks[chunk_idx]
 
         # Window: frames [t-W, ..., t-1]
-        window_frames = chunk[t - self.window:t]    # (W, N, 6)
+        window_frames = chunk[t - self.window:t]     # (W, N, F)
 
         # Future R frames: [t, t+1, ..., t+R-1] — absolute values
-        future = chunk[t:t + self.rollout_steps]     # (R, N, 6)
+        future = chunk[t:t + self.rollout_steps]     # (R, N, F)
 
-        # Flatten window: (W, N, 6) -> (N, W*6)
+        # Flatten window: (W, N, F) -> (N, W*F)
         window_flat = window_frames.permute(1, 0, 2).reshape(self.N, -1)
 
         return window_flat, future

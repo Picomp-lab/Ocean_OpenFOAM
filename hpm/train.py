@@ -1,8 +1,10 @@
 """
-Training script for HPM time-stepping model (Hydra config).
+Training script for HPM time-stepping model (Hydra config, schema-driven).
 
 Features:
-  - Weighted MSE loss (alpha+U at 1.0, p_rgh+nut at 0.1)
+  - Channel schema from config (single source of truth — see schema.py)
+  - Per-channel weighted MSE loss, weights from schema (delta channels only)
+  - Shared rollout closure (schema.advance_window) — identical to inference
   - Gradient clipping
   - wandb logging
   - Checkpoint save/resume (latest.pt + best.pt)
@@ -10,7 +12,6 @@ Features:
   - No DDP (NVLink unavailable)
 """
 
-import os
 import time
 import numpy as np
 import torch
@@ -28,7 +29,12 @@ except ImportError:
     HAS_WANDB = False
 
 from hpm_model import HPM
-from dataset import WaveDataset, compute_stats, load_coords, stats_filename, expand_range
+from schema import ChannelSchema, advance_window, register_autoname_resolver
+from dataset import WaveDataset, load_coords, resolve_stats, expand_range
+
+# Must run at import time, BEFORE @hydra.main resolves hydra.run.dir
+# (which interpolates ${wandb.name} -> ${autoname:}).
+register_autoname_resolver()
 
 
 # ============================================================
@@ -36,21 +42,22 @@ from dataset import WaveDataset, compute_stats, load_coords, stats_filename, exp
 # ============================================================
 
 class WeightedMSELoss(nn.Module):
-    """Per-channel weighted MSE.
+    """Per-channel weighted MSE over DELTA channels only.
 
-    Channels: [alpha, Ux, Uy, Uz, p_rgh, nut]
-    Weights: alpha+U at 1.0, p_rgh+nut at 0.1.
+    Weights come from schema.delta_loss_weights() — declared in config.yaml,
+    never hardcoded here. Weights act in z-normalized delta space (relative
+    importance, not physical scale).
     """
 
-    def __init__(self, weights=None):
+    def __init__(self, weights):
         super().__init__()
-        if weights is None:
-            weights = [1.0, 1.0, 1.0, 1.0, 0.1, 0.1]
-        self.register_buffer('weights', torch.tensor(weights, dtype=torch.float32))
+        assert len(weights) > 0, "empty loss weights"
+        self.register_buffer('weights',
+                             torch.tensor(weights, dtype=torch.float32))
 
     def forward(self, pred, target):
-        mse = (pred - target) ** 2                     # (B, N, F)
-        w = self.weights[None, None, :]                # (1, 1, F)
+        mse = (pred - target) ** 2                     # (B, N, out_dim)
+        w = self.weights[None, None, :]                # (1, 1, out_dim)
         return (mse * w).mean()
 
 
@@ -59,56 +66,52 @@ class WeightedMSELoss(nn.Module):
 # ============================================================
 
 def multistep_rollout_loss(model, coords, window_fields, future_frames,
-                           criterion, field_dim=6, window=6):
+                           criterion, schema):
     """
-    Multi-step autoregressive rollout loss.
+    Multi-step autoregressive rollout loss (full BPTT, no detach).
+
+    Loss is computed on delta channels only (schema.delta_indices); frozen
+    channels are carried through the window unchanged by advance_window.
 
     Args:
         model:         HPM model
         coords:        (B, N, 3) — spatial coordinates
         window_fields: (B, N, W*F) — initial window, flattened
         future_frames: (B, R, N, F) — R ground truth future frames
-        criterion:     loss function
-        field_dim:     number of physical fields (6)
-        window:        temporal window size (W)
+        criterion:     loss over (B, N, out_dim) delta tensors
+        schema:        ChannelSchema
 
     Returns:
-        total_loss: sum of per-step losses
+        mean of per-step losses
     """
     B, R, N, F = future_frames.shape
-    current_window = window_fields  # (B, N, W*F)
+    assert F == schema.field_dim, (
+        f"future_frames has {F} channels, schema expects {schema.field_dim}")
+    delta_idx = torch.as_tensor(schema.delta_indices,
+                                device=future_frames.device)
+
+    current_window = window_fields                              # (B, N, W*F)
     total_loss = 0.0
 
     for step in range(R):
-        # Predict delta
-        delta_pred = model(coords, current_window)             # (B, N, F)
+        # Predict delta for delta channels only: (B, N, out_dim)
+        delta_pred = model(coords, current_window)
 
-        # Current frame = last frame in window
-        current_frame = current_window[:, :, -field_dim:]      # (B, N, F)
+        # Ground truth delta, restricted to delta channels
+        current_frame = current_window[..., -schema.field_dim:]
+        gt_delta = future_frames[:, step] - current_frame       # (B, N, F)
+        gt_delta_sel = gt_delta.index_select(-1, delta_idx)     # (B, N, out_dim)
 
-        # Ground truth delta
-        gt_frame = future_frames[:, step]                      # (B, N, F)
-        gt_delta = gt_frame - current_frame                    # (B, N, F)
+        total_loss = total_loss + criterion(delta_pred, gt_delta_sel)
 
-        # Loss for this step
-        total_loss = total_loss + criterion(delta_pred, gt_delta)
-
-        # Predicted next frame (detach-free — gradients flow through all steps)
-        pred_frame = current_frame + delta_pred                # (B, N, F)
-
-        # Shift window: drop oldest frame, append prediction
-        # current_window: (B, N, W*F) -> drop first F, append pred F
-        current_window = torch.cat([
-            current_window[:, :, field_dim:],                  # (B, N, (W-1)*F)
-            pred_frame                                         # (B, N, F)
-        ], dim=-1)                                             # (B, N, W*F)
+        # Shared closure: scatter delta, freeze non-delta, shift window.
+        _, current_window = advance_window(current_window, delta_pred, schema)
 
     return total_loss / R
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device,
-                    max_grad_norm, coords, scheduler=None,
-                    field_dim=6, window=6):
+                    max_grad_norm, coords, schema, scheduler=None):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -119,10 +122,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
         coords_batch = coords.unsqueeze(0).expand(fields.shape[0], -1, -1)
 
         optimizer.zero_grad()
-        loss = multistep_rollout_loss(
-            model, coords_batch, fields, future, criterion,
-            field_dim=field_dim, window=window
-        )
+        loss = multistep_rollout_loss(model, coords_batch, fields, future,
+                                      criterion, schema)
         loss.backward()
 
         if max_grad_norm > 0:
@@ -139,7 +140,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, coords, field_dim=6, window=6):
+def validate(model, loader, criterion, device, coords, schema):
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -149,10 +150,8 @@ def validate(model, loader, criterion, device, coords, field_dim=6, window=6):
         future = future.to(device)
         coords_batch = coords.unsqueeze(0).expand(fields.shape[0], -1, -1)
 
-        loss = multistep_rollout_loss(
-            model, coords_batch, fields, future, criterion,
-            field_dim=field_dim, window=window
-        )
+        loss = multistep_rollout_loss(model, coords_batch, fields, future,
+                                      criterion, schema)
         total_loss += loss.item()
         n_batches += 1
 
@@ -181,6 +180,10 @@ def main(cfg: DictConfig):
     print(f"Config:\n{OmegaConf.to_yaml(cfg)}")
     print("=" * 60)
 
+    # ---- Channel schema (single source of truth) ----
+    schema = ChannelSchema.from_cfg(cfg)
+    print(schema.describe())
+
     # ---- Load LBO eigenvectors ----
     lbo_dir = Path(cfg.data.dir) / "lbo"
     eigvec_path = lbo_dir / "lbo_eigenvectors.npy"
@@ -188,37 +191,18 @@ def main(cfg: DictConfig):
     spectral_embedding = np.load(eigvec_path)
     print(f"Loaded LBO eigenvectors: {spectral_embedding.shape}")
 
-    # ---- Stats ----
-    # alpha-weighting changes field distributions, so stats are version-specific.
-    # Each (weight_u, weight_nut) combo uses its own stats_u{0|1}_nut{0|1}.npy,
-    # auto-selected — no manual deletion needed.
-    weight_u_by_alpha = cfg.data.get('weight_u_by_alpha', True)
-    weight_nut_by_alpha = cfg.data.get('weight_nut_by_alpha', False)
+    # ---- Stats (versioned by chunk set + channel signature) ----
     train_chunks = expand_range(cfg.data.train_chunk_range)
     val_chunks = expand_range(cfg.data.val_chunk_range)
     print(f"Train chunks: {train_chunks}, Val chunks: {val_chunks}")
-    print(f"Alpha-weighting: U={weight_u_by_alpha}, nut={weight_nut_by_alpha}")
-    stats_path = Path(cfg.data.dir) / stats_filename(
-        train_chunks, weight_u=weight_u_by_alpha, weight_nut=weight_nut_by_alpha)
-    if not stats_path.exists():
-        print(f"Computing dataset statistics -> {stats_path.name}")
-        stats = compute_stats(cfg.data.dir, train_chunks,
-                              weight_u=weight_u_by_alpha,
-                              weight_nut=weight_nut_by_alpha)
-    else:
-        stats = np.load(stats_path)
-        print(f"Loaded {stats_path.name}: mean={stats[0]}, std={stats[1]}")
+    stats = resolve_stats(cfg.data.dir, train_chunks, schema)
 
     # ---- Dataset ----
     rollout_steps = cfg.train.get('rollout_steps', 4)
     train_set = WaveDataset(cfg.data.dir, train_chunks, cfg.data.window,
-                            stats, rollout_steps=rollout_steps,
-                            weight_u_by_alpha=weight_u_by_alpha,
-                            weight_nut_by_alpha=weight_nut_by_alpha)
+                            schema, stats=stats, rollout_steps=rollout_steps)
     val_set = WaveDataset(cfg.data.dir, val_chunks, cfg.data.window,
-                          stats, rollout_steps=rollout_steps,
-                          weight_u_by_alpha=weight_u_by_alpha,
-                          weight_nut_by_alpha=weight_nut_by_alpha)
+                          schema, stats=stats, rollout_steps=rollout_steps)
     print(f"Train samples: {len(train_set)}, Val samples: {len(val_set)}")
     print(f"Rollout steps: {rollout_steps}")
 
@@ -231,11 +215,11 @@ def main(cfg: DictConfig):
     coords = load_coords(cfg.data.dir).to(device)
     print(f"Coords loaded: {coords.shape}, on {coords.device}")
 
-    # ---- Model ----
+    # ---- Model (dims derived from schema) ----
     model = HPM(
         space_dim=3,
-        field_dim=6,
-        out_dim=6,
+        field_dim=schema.field_dim,
+        out_dim=schema.out_dim,
         window=cfg.data.window,
         n_hidden=cfg.model.n_hidden,
         n_layers=cfg.model.n_layers,
@@ -259,7 +243,10 @@ def main(cfg: DictConfig):
         optimizer, max_lr=cfg.train.lr, epochs=cfg.train.epochs,
         steps_per_epoch=len(train_loader), pct_start=0.1
     )
-    criterion = WeightedMSELoss().to(device)
+    loss_weights = schema.delta_loss_weights()
+    print(f"Loss weights (delta channels "
+          f"{[schema.names[i] for i in schema.delta_indices]}): {loss_weights}")
+    criterion = WeightedMSELoss(loss_weights).to(device)
 
     # ---- Resume ----
     start_epoch = 0
@@ -276,8 +263,13 @@ def main(cfg: DictConfig):
         print(f"Resumed from epoch {start_epoch}, best_val={best_val:.6f}")
 
     # ---- wandb ----
+    # 运行名 = autoname (schema diff) + override_dirname (超参 diff, 可为空)
     if HAS_WANDB and cfg.wandb.enabled:
-        wandb.init(project=cfg.wandb.project, name=cfg.wandb.name,
+        from hydra.core.hydra_config import HydraConfig
+        od = HydraConfig.get().job.override_dirname
+        wandb_run_name = cfg.wandb.name + (f"_{od}" if od else "")
+        print(f"wandb run name: {wandb_run_name}")
+        wandb.init(project=cfg.wandb.project, name=wandb_run_name,
                    config=OmegaConf.to_container(cfg, resolve=True))
 
     # ---- Training loop ----
@@ -287,21 +279,34 @@ def main(cfg: DictConfig):
         t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion,
                                      device, cfg.train.max_grad_norm, coords,
-                                     scheduler, field_dim=6, window=cfg.data.window)
-        val_loss = validate(model, val_loader, criterion, device, coords,
-                           field_dim=6, window=cfg.data.window)
+                                     schema, scheduler)
+        val_loss = validate(model, val_loader, criterion, device, coords, schema)
 
         lr = optimizer.param_groups[0]['lr']
         elapsed = time.time() - t0
+
+        # Peak GPU memory (cumulative since start; epoch-1 steady state is
+        # usually THE peak). alloc = tensors; reserved = allocator footprint
+        # (what nvidia-smi shows) — use reserved for OOM headroom judgement.
+        if torch.cuda.is_available():
+            mem_alloc = torch.cuda.max_memory_allocated() / 1e9
+            mem_reserved = torch.cuda.max_memory_reserved() / 1e9
+            mem_str = f" mem={mem_alloc:.1f}/{mem_reserved:.1f}GB"
+        else:
+            mem_alloc = mem_reserved = 0.0
+            mem_str = ""
+
         print(f"Epoch {epoch:03d} | train={train_loss:.6f} val={val_loss:.6f} "
-              f"lr={lr:.2e} ({elapsed:.1f}s)")
+              f"lr={lr:.2e} ({elapsed:.1f}s){mem_str}")
 
         # wandb
         if HAS_WANDB and cfg.wandb.enabled:
             wandb.log({"train_loss": train_loss,
                        "val_loss": val_loss,
                        "lr": lr,
-                       "epoch": epoch
+                       "epoch": epoch,
+                       "gpu_mem_alloc_gb": mem_alloc,
+                       "gpu_mem_reserved_gb": mem_reserved,
                        })
 
         # Update best_val first

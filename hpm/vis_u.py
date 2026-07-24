@@ -1,13 +1,30 @@
 """
 RGB Velocity Visualization for HPM rollout — PyVista-slice based.
 
-速度三分量编码为颜色（αU 或 U 空间，由模型 config 决定，不还原）：
-  R = |Ux|/max, G = |Uy|/max, B = |Uz|/max, Opacity = |U|/max
-  pred 上叠加方向误差（>90° 标黄）。
-Top: GT, Bottom: HPM Prediction.
+Schema-driven（见 schema.py）：
+  - 通道集合 / alpha-weighting / stats 来自 checkpoint 的 config
+    （旧 config 无 channels 键 -> legacy fallback，旧模型仍可可视化）
+  - rollout 闭合用共享 advance_window，与训练同一份代码
+  - 速度分量按名查找（Ux/Uy/Uz），不再假设索引 1/2/3
 
-切片几何用预计算缓存 (slice_y0.30/)，运行时纯 numpy。
---style both 输出 {output}_tri.mp4（精准连续）和 {output}_scatter.mp4（快速离散）。
+产出两类视频（同一次 rollout 复用）：
+
+  (A) 老图：速度三分量编码为一张彩色图（αU 或 U 空间，由 schema 决定，不还原）
+      R = |Ux|/max, G = |Uy|/max, B = |Uz|/max, Opacity = |U|/max
+      pred 上叠加方向误差（>90° 标黄）。看整体方向性 (directionality)。
+
+  (B) 三分量单独：Ux / Uy / Uz 各一张，暗底 + 双色相 (two-hue)
+      warm 暖=正 / cool 冷=负，饱和度 saturation = |分量|。
+      三分量共享一对色相 + 共享色标 V=max(P99|Ux|,P99|Uy|,P99|Uz|)，
+      保留跨分量量级对比性。单分量图不叠黄块（方向诊断交给老图）。
+
+Top: GT, Bottom: HPM Prediction。切片几何用预计算缓存 (slice_y0.30/)，运行时纯 numpy。
+--style both -> 每类各出 _tri.mp4（精准连续）和 _scatter.mp4（快速离散）。
+
+输出文件（out_base = compare_chunkN_u.mp4，chunk 目录下）：
+  老图:   compare_chunkN_u_tri.mp4      compare_chunkN_u_scatter.mp4
+  三分量: compare_chunkN_u_aUx_tri.mp4  compare_chunkN_u_aUx_scatter.mp4  (Uy/Uz 同)
+  RMSE:   compare_chunkN_u.npy  (|U| full-field, 与老版一致)
 
 Usage:
     python -u vis_u.py --config_path .../config.yaml --checkpoint .../best.pt \
@@ -27,13 +44,16 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from hpm_model import HPM
-from dataset import load_coords, apply_alpha_weighting, stats_filename, expand_range
+from schema import ChannelSchema, advance_window
+from dataset import load_coords, load_chunk, resolve_stats, expand_range
 
 MID_Y = 0.30
 
 
 @torch.no_grad()
-def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps, device):
+def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps,
+            device, schema):
+    """窗口滑动 / frozen 通道处理由共享 advance_window 完成（与训练零漂移）。"""
     mean, std = stats[0], stats[1]
     normalize = lambda x: (x - mean) / std
     denormalize = lambda x: x * std + mean
@@ -46,17 +66,15 @@ def rollout(model, coords_norm, data_w, stats, window, start_frame, n_steps, dev
     coords_batch = coords_norm.unsqueeze(0)
 
     for step in range(n_steps):
-        delta = model(coords_batch, fields_w)
-        pred_norm = fields_w[0, :, -6:] + delta[0]
-        pred_np = denormalize(pred_norm.cpu().numpy())
-        predictions.append(pred_np)
-        fields_w = torch.cat([fields_w[..., 6:], pred_norm.unsqueeze(0)], dim=-1)
+        delta = model(coords_batch, fields_w)               # (1, N, out_dim)
+        pred_frame, fields_w = advance_window(fields_w, delta, schema)
+        predictions.append(denormalize(pred_frame[0].cpu().numpy()))
 
     return np.stack(predictions)
 
 
 def build_rgba_points(ux, uy, uz, ux_max, uy_max, uz_max, umag_max):
-    """逐点 RGBA。ux/uy/uz: (M,) 切片点上的速度分量。返回 (M,4)。"""
+    """老图逐点 RGBA。ux/uy/uz: (M,) 切片点上的速度分量。返回 (M,4)。"""
     r = np.clip(np.abs(ux) / max(ux_max, 1e-10), 0, 1)
     g = np.clip(np.abs(uy) / max(uy_max, 1e-10), 0, 1)
     b = np.clip(np.abs(uz) / max(uz_max, 1e-10), 0, 1)
@@ -70,6 +88,15 @@ def composite_over_bg(rgba, bg):
     a = rgba[:, 3:4]
     rgb = rgba[:, :3]
     return np.clip(rgb * a + np.array(bg).reshape(1, 3) * (1 - a), 0, 1)
+
+
+def build_component_rgb(v, vmax, bg, warm, cool):
+    """单分量双色相 (two-hue) 逐点 RGB。
+    v: (M,) 带符号 signed 分量值；vmax: 共享色标 shared scale；
+    正值走 warm 暖、负值走 cool 冷，饱和度 saturation = |v|/vmax（over 暗底）。返回 (M,3)。"""
+    a = np.clip(np.abs(v) / max(vmax, 1e-10), 0, 1)[:, None]          # (M,1)
+    base = np.where((v >= 0)[:, None], warm[None, :], cool[None, :])  # (M,3)
+    return np.clip(base * a + np.array(bg).reshape(1, 3) * (1 - a), 0, 1)
 
 
 def main():
@@ -96,14 +123,21 @@ def main():
     # ---- model + config ----
     print("Loading model...")
     cfg = OmegaConf.load(args.config_path)
+    schema = ChannelSchema.from_cfg(cfg)
+    print(schema.describe())
     spectral_embedding = np.load(data_dir / "lbo" / "lbo_eigenvectors.npy")
-    weight_u = cfg.data.get('weight_u_by_alpha', True)
-    weight_nut = cfg.data.get('weight_nut_by_alpha', False)
     train_chunks = expand_range(cfg.data.train_chunk_range)
-    stats = np.load(data_dir / stats_filename(train_chunks, weight_u=weight_u, weight_nut=weight_nut))
+    stats = resolve_stats(data_dir, train_chunks, schema)
+
+    # 速度分量按名查找（不再假设 1/2/3）
+    for c in ("Ux", "Uy", "Uz"):
+        assert c in schema.names, \
+            f"vis_u.py requires velocity channel '{c}' in schema {schema.names}"
+    iux, iuy, iuz = (schema.names.index(c) for c in ("Ux", "Uy", "Uz"))
 
     model = HPM(
-        space_dim=3, field_dim=6, out_dim=6,
+        field_dim=schema.field_dim, out_dim=schema.out_dim,
+        space_dim=3,
         window=cfg.data.window,
         n_hidden=cfg.model.n_hidden, n_layers=cfg.model.n_layers,
         n_heads=cfg.model.n_heads, freq_num=cfg.model.freq_num,
@@ -114,20 +148,19 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"]); model.eval()
 
-    # ---- data + αU ----
+    # ---- data（schema 选列 + alpha-weighting，与训练同空间）----
     print("Loading data...")
-    raw = np.load(data_dir / f"chunk_{args.chunk_id:03d}_data.npy")
+    data_w = load_chunk(data_dir, args.chunk_id, schema)
     times = np.load(data_dir / f"chunk_{args.chunk_id:03d}_times.npy")
     coords_norm = load_coords(args.data_dir).to(device)
-    print(f"Alpha-weighting: U={weight_u}, nut={weight_nut}")
-    data_w = apply_alpha_weighting(raw, weight_u=weight_u, weight_nut=weight_nut)
 
     W = cfg.data.window
     start = max(args.start_frame, W - 1)
     n_steps = min(args.n_frames, data_w.shape[0] - start - 1)
 
     print(f"Rolling out {n_steps} steps...")
-    preds = rollout(model, coords_norm, data_w, stats, W, start, n_steps, device)
+    preds = rollout(model, coords_norm, data_w, stats, W, start, n_steps,
+                    device, schema)
     gts = data_w[start + 1: start + 1 + n_steps]
     gt_times = times[start + 1: start + 1 + n_steps]
 
@@ -137,12 +170,11 @@ def main():
     xz = np.load(sdir / "slice_xz.npy")
     tri_simplices = np.load(sdir / "slice_tri.npy")
     x_s, z_s = xz[:, 0], xz[:, 1]
-    triang = mtri.Triangulation(x_s, z_s, triangles=tri_simplices)
     print(f"Slice cache: {len(cell_map)} faces @ y={MID_Y}")
 
-    # 速度分量在切片点上 (n_steps, M)
-    gt_u = (gts[:, cell_map, 1], gts[:, cell_map, 2], gts[:, cell_map, 3])
-    pr_u = (preds[:, cell_map, 1], preds[:, cell_map, 2], preds[:, cell_map, 3])
+    # 速度分量在切片点上 (n_steps, M) — 索引来自 schema
+    gt_u = (gts[:, cell_map, iux], gts[:, cell_map, iuy], gts[:, cell_map, iuz])
+    pr_u = (preds[:, cell_map, iux], preds[:, cell_map, iuy], preds[:, cell_map, iuz])
 
     # 归一化用 GT 的 αU/U percentile
     ux_max = np.percentile(np.abs(gt_u[0]), 99)
@@ -151,8 +183,8 @@ def main():
     umag_max = np.percentile(np.sqrt(gt_u[0]**2 + gt_u[1]**2 + gt_u[2]**2), 99)
     print(f"Norm: |Ux|={ux_max:.3f} |Uy|={uy_max:.3f} |Uz|={uz_max:.3f} |U|={umag_max:.3f}")
 
-    # 动态标签：αU vs U
-    vp = "αU" if weight_u else "U"   # velocity prefix
+    # 动态标签：αU vs U（由 schema 的 alpha_weighted 决定）
+    vp = "αU" if schema.alpha_weighted[iux] else "U"   # velocity prefix
     legend_text = (f"R=|{vp}x|  G=|{vp}y|  B=|{vp}z|  "
                    f"Opacity=|{vp}|  Yellow=dir err (>90°)")
 
@@ -160,8 +192,25 @@ def main():
     yellow = np.array([1.0, 0.9, 0.0])
     xlim = (x_s.min(), x_s.max()); zlim = (z_s.min(), z_s.max())
 
+    # ---- 共用渲染原语 (render primitive)：逐点 RGB -> tri/scatter，老图与三分量共用 ----
+    def render_points(ax, rgb, style, label):
+        ax.clear()
+        if style == "tri":
+            # 每三角形 RGB = 三顶点均值。PolyCollection 原生支持真彩色，
+            # 不绕 tripcolor 的标量映射，跨 mpl 版本最稳。
+            tri_rgb = rgb[tri_simplices].mean(axis=1)                        # (T,3)
+            verts = np.stack([x_s[tri_simplices], z_s[tri_simplices]], axis=-1)  # (T,3,2)
+            ax.add_collection(PolyCollection(verts, facecolors=tri_rgb, edgecolors='none'))
+        else:
+            ax.scatter(x_s, z_s, c=rgb, s=args.point_size, edgecolors='none')
+        ax.set_facecolor(bg); ax.set_xlim(xlim); ax.set_ylim(zlim)
+        ax.set_xlabel("X (m)", fontsize=20, color='white')
+        ax.set_ylabel("Z (m)", fontsize=20, color='white')
+        ax.tick_params(labelsize=16, colors='white')
+        ax.set_title(label, fontsize=24, color='white')
+
     def frame_colors(frame):
-        """返回该帧 gt_rgb(M,3), pred_rgb(M,3, 含方向误差叠加), error_pct。"""
+        """老图：该帧 gt_rgb(M,3), pred_rgb(M,3, 含方向误差叠加), error_pct。"""
         out = {}
         for label, src in [("gt", gt_u), ("pred", pr_u)]:
             ux, uy, uz = src[0][frame], src[1][frame], src[2][frame]
@@ -191,9 +240,12 @@ def main():
     styles = ["tri", "scatter"] if args.style == "both" else [args.style]
     out_base = Path(args.output)
 
+    # ============================================================
+    # (A) 老图：RGB 合成 + 黄块方向误差
+    # ============================================================
     for style in styles:
         out_path = out_base.with_name(f"{out_base.stem}_{style}{out_base.suffix}")
-        print(f"[{style}] -> {out_path}")
+        print(f"[RGB/{style}] -> {out_path}")
         fig, (ax_gt, ax_pred) = plt.subplots(2, 1, figsize=(38.4, 21.6), dpi=100)
         fig.patch.set_facecolor(bg)
         fig.subplots_adjust(top=0.92, bottom=0.06, left=0.05, right=0.95, hspace=0.12)
@@ -201,27 +253,10 @@ def main():
                  family='monospace')
         suptitle = fig.suptitle("", fontsize=28, color='white', y=0.94)
 
-        def draw(ax, rgb, label):
-            ax.clear()
-            if style == "tri":
-                # 每三角形 RGB = 三顶点均值。PolyCollection 原生支持真彩色，
-                # 不绕 tripcolor 的标量映射，跨 mpl 版本最稳。
-                tri_rgb = rgb[tri_simplices].mean(axis=1)        # (T,3)
-                verts = np.stack([x_s[tri_simplices], z_s[tri_simplices]], axis=-1)  # (T,3,2)
-                pc = PolyCollection(verts, facecolors=tri_rgb, edgecolors='none')
-                ax.add_collection(pc)
-            else:
-                ax.scatter(x_s, z_s, c=rgb, s=args.point_size, edgecolors='none')
-            ax.set_facecolor(bg); ax.set_xlim(xlim); ax.set_ylim(zlim)
-            ax.set_xlabel("X (m)", fontsize=20, color='white')
-            ax.set_ylabel("Z (m)", fontsize=20, color='white')
-            ax.tick_params(labelsize=16, colors='white')
-            ax.set_title(label, fontsize=24, color='white')
-
         def update(frame):
             gt_rgb, pred_rgb, err_pct = frame_colors(frame)
-            draw(ax_gt, gt_rgb, "Ground Truth")
-            draw(ax_pred, pred_rgb, "HPM Prediction")
+            render_points(ax_gt, gt_rgb, style, "Ground Truth")
+            render_points(ax_pred, pred_rgb, style, "HPM Prediction")
             gm = np.sqrt(gt_u[0][frame]**2 + gt_u[1][frame]**2 + gt_u[2][frame]**2)
             pm = np.sqrt(pr_u[0][frame]**2 + pr_u[1][frame]**2 + pr_u[2][frame]**2)
             rmse = np.sqrt(np.mean((gm - pm)**2))
@@ -233,12 +268,61 @@ def main():
         ani.save(str(out_path), writer="ffmpeg", fps=args.fps,
                  extra_args=['-vcodec','libx264','-pix_fmt','yuv420p'])
         plt.close()
-        print(f"[{style}] saved")
+        print(f"[RGB/{style}] saved")
 
-    # |U| RMSE summary (全场)
+    # ============================================================
+    # (B) 三分量单独：双色相 warm=+ / cool=−，共享色标 V
+    #     V = max(P99|Ux|, P99|Uy|, P99|Uz|)  -> 保留跨分量量级对比
+    # ============================================================
+    V = max(ux_max, uy_max, uz_max)
+    warm = np.array([1.0, 0.45, 0.12])   # 正 positive : 暖橙红 orange-red
+    cool = np.array([0.12, 0.60, 1.0])   # 负 negative : 冷青蓝 cyan-blue
+    print(f"Component shared scale V={V:.3f}  (warm=+, cool=-)")
+
+    # (显示名, gt_u/pr_u 索引, +物理含义, −物理含义)
+    comp_defs = [
+        (f"{vp}x", 0, "shoreward +X", "seaward -X"),
+        (f"{vp}y", 1, "lateral +Y",   "lateral -Y"),
+        (f"{vp}z", 2, "rising +Z",     "plunging -Z"),
+    ]
+
+    for cname, cidx, pos_txt, neg_txt in comp_defs:
+        g_comp = gt_u[cidx]   # (n_steps, M)
+        p_comp = pr_u[cidx]
+        comp_legend = (f"Warm=+ ({pos_txt})    Cool=- ({neg_txt})    "
+                       f"Saturation=|{cname}|    shared max V={V:.3f}")
+        cfile = cname.replace("α", "a")   # 文件名避免非 ASCII: αUx -> aUx
+
+        for style in styles:
+            out_path = out_base.with_name(f"{out_base.stem}_{cfile}_{style}{out_base.suffix}")
+            print(f"[{cname}/{style}] -> {out_path}")
+            fig, (ax_gt, ax_pred) = plt.subplots(2, 1, figsize=(38.4, 21.6), dpi=100)
+            fig.patch.set_facecolor(bg)
+            fig.subplots_adjust(top=0.92, bottom=0.06, left=0.05, right=0.95, hspace=0.12)
+            fig.text(0.5, 0.97, comp_legend, ha='center', fontsize=22, color='white',
+                     family='monospace')
+            suptitle = fig.suptitle("", fontsize=28, color='white', y=0.94)
+
+            def update(frame):
+                gt_rgb = build_component_rgb(g_comp[frame], V, bg, warm, cool)
+                pred_rgb = build_component_rgb(p_comp[frame], V, bg, warm, cool)
+                render_points(ax_gt, gt_rgb, style, "Ground Truth")
+                render_points(ax_pred, pred_rgb, style, "HPM Prediction")
+                rmse = np.sqrt(np.mean((g_comp[frame] - p_comp[frame])**2))
+                suptitle.set_text(f"t={gt_times[frame]:.2f}s | {cname} | "
+                                  f"Step {frame} | RMSE={rmse:.4f}")
+
+            ani = animation.FuncAnimation(fig, update, frames=n_steps,
+                                          interval=1000//args.fps, blit=False)
+            ani.save(str(out_path), writer="ffmpeg", fps=args.fps,
+                     extra_args=['-vcodec','libx264','-pix_fmt','yuv420p'])
+            plt.close()
+            print(f"[{cname}/{style}] saved")
+
+    # |U| RMSE summary (全场，与老版一致) — 索引来自 schema
     rmse_arr = np.array([
-        np.sqrt(np.mean((np.sqrt(gts[f,:,1]**2+gts[f,:,2]**2+gts[f,:,3]**2)
-                       - np.sqrt(preds[f,:,1]**2+preds[f,:,2]**2+preds[f,:,3]**2))**2))
+        np.sqrt(np.mean((np.sqrt(gts[f,:,iux]**2+gts[f,:,iuy]**2+gts[f,:,iuz]**2)
+                       - np.sqrt(preds[f,:,iux]**2+preds[f,:,iuy]**2+preds[f,:,iuz]**2))**2))
         for f in range(n_steps)])
     print(f"|{vp}| RMSE: start={rmse_arr[0]:.4f} end={rmse_arr[-1]:.4f} mean={rmse_arr.mean():.4f}")
     np.save(out_base.with_suffix(".npy"), rmse_arr)

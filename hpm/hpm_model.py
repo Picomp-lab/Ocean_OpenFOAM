@@ -3,15 +3,17 @@ HPM (Holistic Physics Mixer) adapted for time-stepping prediction.
 
 Based on HPM_Irregular_Mesh.py from the original HPM paper (ICML 2025),
 adapted for field-to-field temporal prediction with:
-  - Temporal window (W=6) with exponential decay aggregator + finite differences
+  - Temporal window (W frames) with exponential decay aggregator + finite differences
   - Residual learning (predict delta from most recent frame)
   - LBO eigenbasis from OpenFOAM graph Laplacian
   - Gradient checkpointing for large meshes
 
-Input:  (B, N, 3 + 6*W)  — coordinates + W frames of 6 physical fields
-Output: (B, N, 6)         — predicted delta (residual) for next timestep
+Channel-agnostic: field_dim / out_dim are REQUIRED constructor arguments with
+no defaults — they must come from ChannelSchema (schema.py), never be assumed.
+out_dim may be < field_dim (delta channels only; frozen channels have no head).
 
-Physical fields: [alpha.water, Ux, Uy, Uz, p_rgh, nut]
+Input:  (B, N, 3 + field_dim*W)  — coordinates + W frames of field_dim fields
+Output: (B, N, out_dim)          — predicted delta for the DELTA channels
 """
 
 import math
@@ -125,7 +127,7 @@ class MLP(nn.Module):
 class MixerBlock(nn.Module):
     def __init__(self, hidden_dim, n_heads, dropout, freq_num,
                  spectral_embedding, mlp_ratio=1, act='gelu',
-                 last_layer=False, out_dim=6, use_ckpt=False):
+                 last_layer=False, out_dim=None, use_ckpt=False):
         super().__init__()
         self.last_layer = last_layer
         self.use_ckpt = use_ckpt
@@ -141,6 +143,7 @@ class MixerBlock(nn.Module):
                         n_layers=0, res=False, act=act)
 
         if last_layer:
+            assert out_dim is not None, "last_layer=True requires out_dim"
             self.ln3 = nn.LayerNorm(hidden_dim)
             self.head = nn.Linear(hidden_dim, out_dim)
 
@@ -165,20 +168,21 @@ class HPM(nn.Module):
     """
     HPM adapted for field-to-field time-stepping prediction.
 
-    Temporal features extracted from window of W frames:
-      - macro_history: weighted average via exponential-decay aggregator (6 ch)
-      - dt:  1st-order finite difference from last two frames (6 ch)
-      - dt2: 2nd-order finite difference from last three frames (6 ch)
-    Total temporal features: 18 channels
+    Temporal features extracted from window of W frames (F = field_dim):
+      - macro_history: weighted average via exponential-decay aggregator (F ch)
+      - dt:  1st-order finite difference from last two frames (F ch)
+      - dt2: 2nd-order finite difference from last three frames (F ch)
+    Total temporal features: 3*F channels
 
-    Input to backbone: coords(3) + temporal_features(18) = 21 dims
-    Positional embedding from LBO eigenvectors optionally appended.
+    Input to backbone: coords(3) + temporal_features(3*F) [+ spectral_pos]
+    Head outputs out_dim channels (= number of DELTA channels in the schema;
+    frozen / non-predicted channels have no head — fork-1b).
     """
 
     def __init__(self,
+                 field_dim,          # REQUIRED — from ChannelSchema, no default
+                 out_dim,            # REQUIRED — from ChannelSchema, no default
                  space_dim=3,
-                 field_dim=6,
-                 out_dim=6,
                  window=6,
                  n_hidden=64,
                  n_layers=4,
@@ -193,6 +197,8 @@ class HPM(nn.Module):
                  max_grad_norm=0.1):
         super().__init__()
         assert window >= 3, "Window must be >= 3 for finite differences"
+        assert 0 < out_dim <= field_dim, \
+            f"out_dim={out_dim} must be in (0, field_dim={field_dim}]"
         self.field_dim = field_dim
         self.window = window
         self.spectral_pos_dim = spectral_pos_dim
@@ -202,7 +208,7 @@ class HPM(nn.Module):
         self.time_aggregator = nn.Linear(window, 1)
 
         # --- Preprocessing ---
-        # Input: coords(3) + macro_history(6) + dt(6) + dt2(6) + spectral_pos
+        # Input: coords(3) + macro_history(F) + dt(F) + dt2(F) + spectral_pos
         input_dim = space_dim + field_dim * 3 + spectral_pos_dim
         self.preprocess = nn.Sequential(
             nn.Linear(input_dim, n_hidden * 2), nn.GELU(),
@@ -251,10 +257,10 @@ class HPM(nn.Module):
         Extract temporal features from windowed field data.
 
         Args:
-            fields: (B, N, W, F) — W frames of F=6 physical fields
+            fields: (B, N, W, F) — W frames of F=field_dim physical fields
 
         Returns:
-            (B, N, 3*F) — macro_history(6) + dt(6) + dt2(6) = 18 channels
+            (B, N, 3*F) — macro_history(F) + dt(F) + dt2(F)
         """
         # Macro history: weighted average across time window
         # fields: (B, N, W, F) -> permute -> (B, N, F, W)
@@ -277,7 +283,7 @@ class HPM(nn.Module):
             fields: (B, N, W*F)   — W frames × F fields, flattened
 
         Returns:
-            delta: (B, N, out_dim) — predicted residual
+            delta: (B, N, out_dim) — predicted residual for DELTA channels
         """
         B, N, _ = coords.shape
 
@@ -285,7 +291,7 @@ class HPM(nn.Module):
         fields_4d = fields.reshape(B, N, self.window, self.field_dim)
 
         # Extract temporal features
-        temporal = self.extract_temporal_features(fields_4d)     # (B, N, 18)
+        temporal = self.extract_temporal_features(fields_4d)     # (B, N, 3F)
 
         # Build input: coords + temporal + optional spectral pos
         if self.spectral_pos_dim > 0:

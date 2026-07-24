@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/hpm_train_%j.log
+#SBATCH --output=/nfs/hpc/share/baoh/models/hpm/logs/hpm_train_%j.log
 
 cd ~/hpc-share/models/hpm
 
@@ -26,10 +26,11 @@ echo "Python:   $(python --version)"
 echo "PyTorch:  $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA:     $(python -c 'import torch; print(torch.version.cuda)')"
 echo "Date:     $(date)"
+echo "Overrides: ${@:-<none (baseline)>}"
 echo "========================================"
 
 # ============================================================
 # Train — all config from config.yaml
 # Override via command line: python train.py model.n_hidden=128
 # ============================================================
-python -u train.py data.weight_u_by_alpha=true wandb.name=hpm_flux_u_h128
+python -u train.py "$@"

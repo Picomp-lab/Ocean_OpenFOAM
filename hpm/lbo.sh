@@ -49,7 +49,7 @@ echo "Memory:   $SLURM_MEM_PER_NODE"
 echo "Date:     $(date)"
 echo "========================================"
 
-python -u compute_lbo_eigenbasis.py \
+python -u lbo.py \
     --case "$CASE_DIR" \
     --cellset "$CELLSET" \
     --coords "$COORDS" \

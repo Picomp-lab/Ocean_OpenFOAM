@@ -5,12 +5,42 @@ data:
   val_chunk_range: [8]
   test_chunk_range: [9]
   window: 6
-  # Alpha-weighting (momentum-density-like). Each version uses its OWN
-  # stats file: stats_u{0|1}_nut{0|1}.npy (auto-selected). No manual deletion.
-  #   weight_u_by_alpha:   True = alpha*U (alpha-U model), False = raw U (single-U model)
-  #   weight_nut_by_alpha: ablation switch for nut
-  weight_u_by_alpha: false
-  weight_nut_by_alpha: false
+
+  # ============================================================
+  # Channel schema — SINGLE SOURCE OF TRUTH (see schema.py).
+  # Order here == tensor channel order. Everything else is derived:
+  # field_dim, out_dim, loss weights, alpha-weighting, stats filename.
+  #
+  #   name:           must be one of DISK_CHANNELS
+  #                   [alpha, Ux, Uy, Uz, p_rgh, nut] (disk files stay 6-ch;
+  #                   channels selected BY NAME at load time)
+  #   enabled:        false = channel does NOT exist for the model at all —
+  #                   not an input, no head, no stats, no field_dim
+  #                   contribution (equivalent to deleting the row; Method C).
+  #                   'alpha' cannot be disabled.
+  #   update_rule:    delta  = predicted by delta head
+  #                   frozen = STILL AN INPUT, but carried unchanged in
+  #                            rollout, no head, no loss (Method B)
+  #                   flux_div = reserved for E2 flux head (not implemented)
+  #   loss_weight:    per-channel MSE weight in z-normalized delta space
+  #                   (relative importance, not physical scale). Affects
+  #                   gradients AND val_loss (hence best.pt selection).
+  #                   NEVER use loss_weight 0.0 with update_rule delta —
+  #                   unsupervised head pollutes rollout; use frozen/enabled.
+  #   alpha_weighted: multiply by alpha in physical space (αU Design 2)
+  #
+  # Ablation usage:
+  #   E1 Method B (nut input-only): nut -> update_rule: frozen, loss_weight: 0.0
+  #   E1 Method C (nut fully out):  nut -> enabled: false
+  # Stats files are auto-versioned by channel signature — no manual deletion.
+  # ============================================================
+  channels:
+    - {name: alpha, enabled: true, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Ux,    enabled: true, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Uy,    enabled: true, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Uz,    enabled: true, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: p_rgh, enabled: true, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: nut,   enabled: true, update_rule: delta, loss_weight: 0.1, alpha_weighted: false}
 
 model:
   n_hidden: 128
@@ -32,10 +62,25 @@ train:
   rollout_steps: 4
 
 hydra:
+  job:
+    config:
+      # CLI 覆盖自动进入目录名与 wandb 运行名（超参 diff 的自动编码）。
+      # 与 autoname 互补：autoname 管 schema diff，override_dirname 管超参 diff。
+      # 纪律：schema 消融改 yaml（autoname 命名），超参实验走 CLI（此处命名）；
+      # 直接改 yaml 里的超参 = 定义新 baseline，不会出现在名字里（语义正确）。
+      override_dirname:
+        # autoname 已编码 enabled/update_rule（no-/frz-/flux- 标记），
+        # 从 dirname 排除避免冗余；loss_weight 不排除（autoname 不编码它）。
+        # 注意：键按通道行号（.5 = nut），若重排 channels 列表需同步更新。
+        exclude_keys: [wandb.enabled, wandb.name, wandb.name_suffix,
+                       train.num_workers,
+                       data.channels.5.enabled, data.channels.5.update_rule]
+        kv_sep: '-'
+        item_sep: '_'
   run:
-    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: outputs/${wandb.name}/${hydra.job.override_dirname}/${now:%Y-%m-%d_%H-%M-%S}
   sweep:
-    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: outputs/${wandb.name}/${hydra.job.override_dirname}/${now:%Y-%m-%d_%H-%M-%S}
     subdir: ${hydra.job.num}
 
 save:
@@ -44,4 +89,10 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  name: hpm_bl_h128
+  # 运行名自动从 schema + n_hidden 派生（见 schema.py auto_run_name）：
+  #   E0 -> hpm_bl_h128,  E1-C -> hpm_no-nut_h128,  E1-B -> hpm_frz-nut_h128
+  # hydra 输出目录和 vis.sh 的 FEATURE 都跟随此名。
+  # 手动覆盖: python train.py wandb.name=custom
+  # 加尾标:   python train.py wandb.name_suffix=lr5e4  -> hpm_bl_h128_lr5e4
+  name: ${autoname:}
+  name_suffix: ""
