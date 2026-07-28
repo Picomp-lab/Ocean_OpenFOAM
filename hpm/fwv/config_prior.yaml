@@ -1,0 +1,83 @@
+# ============================================================
+# config_prior.yaml — 1b capability check
+#   输入 = prior(t), base = prior(t), 无时间窗、无自反馈、R=1
+# 与 config.yaml 独立, 现有 E0/E1 实验不受影响。
+# ============================================================
+data:
+  dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05
+  prior_dir: ${oc.env:HOME}/hpc-share/models/data/3d/prior_t015
+
+  # chunk 9 的 prior 已失效 (raw 空间 Uz nRMSE=1.02 > 1, 即 prior 比常数基线
+  # 还差; 冒烟实测同样是 1.021)。用它选 best.pt 等于让模型去优化一个 prior
+  # 已经不成立的 chunk。故 val 用 chunk 8, chunk 9 留作最终测试、不参与选择。
+  # 若要沿用 train 1-8: data.train_chunk_range=[1,8] data.val_chunk_range=[9]
+  train_chunk_range: [1, 7]
+  val_chunk_range: [8]
+  # 仅供最终评估 / 可视化, 不参与训练与模型选择。
+  # chunk 9 的 prior 已失效 (Uz nRMSE=1.02), 看它是为了确认失效的表现形态,
+  # 不是拿它当性能指标。chunk 10 数据损坏 (GT 只有 1 帧), 不可用。
+  test_chunk_range: [9]
+
+  # window=0 : 无时间特征。模型只看当前帧 prior ->
+  #   无 rollout 漂移 (没有反馈回路), 无 cold start (t=0 即可预测)。
+  window: 0
+
+  # ------------------------------------------------------------
+  # 只保留有有效 prior 的通道。依据 diag_prior.py (10 chunk, raw 空间):
+  #   通道    nRMSE_prior   判定
+  #   alpha      0.42       有效
+  #   Ux         0.92       弱有效
+  #   Uz         0.96       弱有效
+  #   p_rgh      0.69       有效
+  #   Uy         1.01       无效 —— corr ~= 0, 比常数基线还差, prior 在加噪
+  #   nut         --        FUNWAVE 无湍流模型, 结构上没有 prior
+  # Uy / nut 在 1b 下必须 disabled: 它们没有可用 base, 而 1b 没有自反馈路径。
+  #
+  # alpha_weighted 全 false —— 与现行 config.yaml 一致 (单变量原则: 1b 已经
+  # 改了通道数/时间建模/base, 不再叠加空间变换)。
+  # αU 空间下 prior 匹配更好 (Ux 0.92->0.80, Uz 0.96->0.89), 但那是因为
+  # prior 空气区恒为 0 而 CFD 气相有速度 —— 乘 alpha 把这块空间定义差异压掉,
+  # 是掩盖而非解决。作为第二个 arm 单独测: 只翻 Ux/Uz 的 alpha_weighted。
+  # ------------------------------------------------------------
+  channels:
+    - {name: alpha, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Ux,    enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Uy,    enabled: false}
+    - {name: Uz,    enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: p_rgh, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: nut,   enabled: false}
+
+model:
+  n_hidden: 128
+  n_layers: 6
+  n_heads: 8
+  freq_num: 64
+  dropout: 0.1
+  mlp_ratio: 2
+  spectral_pos_dim: 0
+  use_ckpt: true
+
+train:
+  batch_size: 1
+  lr: 5e-4
+  weight_decay: 1e-4
+  epochs: 50
+  max_grad_norm: 1.0
+  num_workers: 4
+  # rollout_steps 不适用 —— 1b 无反馈回路, R>1 等价于扩大 batch
+
+hydra:
+  run:
+    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: outputs/${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+save:
+  dir: ${hydra:runtime.output_dir}/checkpoints
+
+wandb:
+  enabled: true
+  project: hpm-wave
+  # 手动命名 (不走 autoname): 1b 与现有 schema 消融不在同一命名空间
+  name: hpm_prior1b_h128
