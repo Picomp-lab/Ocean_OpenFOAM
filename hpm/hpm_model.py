@@ -13,6 +13,7 @@ no defaults — they must come from ChannelSchema (schema.py), never be assumed.
 out_dim may be < field_dim (delta channels only; frozen channels have no head).
 
 Input:  (B, N, 3 + field_dim*W)  — coordinates + W frames of field_dim fields
+        window=0 -> (B, N, field_dim): single frame, no temporal features (1b mode)
 Output: (B, N, out_dim)          — predicted delta for the DELTA channels
 """
 
@@ -196,7 +197,12 @@ class HPM(nn.Module):
                  use_ckpt=True,
                  max_grad_norm=0.1):
         super().__init__()
-        assert window >= 3, "Window must be >= 3 for finite differences"
+        # window == 0 : 无时间特征 (1b / prior-only 模式)。输入就是单帧场本身,
+        #   没有历史、没有自反馈 -> 无 rollout 漂移、无 cold start。
+        # window >= 3 : 原有时间窗模式 (macro/dt/dt2 需要至少 3 帧)。
+        self.no_temporal = (window == 0)
+        assert self.no_temporal or window >= 3, \
+            "window must be 0 (no temporal features) or >= 3 (finite differences)"
         assert 0 < out_dim <= field_dim, \
             f"out_dim={out_dim} must be in (0, field_dim={field_dim}]"
         self.field_dim = field_dim
@@ -205,11 +211,14 @@ class HPM(nn.Module):
         self.max_grad_norm = max_grad_norm
 
         # --- Temporal feature extraction ---
-        self.time_aggregator = nn.Linear(window, 1)
+        if not self.no_temporal:
+            self.time_aggregator = nn.Linear(window, 1)
 
         # --- Preprocessing ---
-        # Input: coords(3) + macro_history(F) + dt(F) + dt2(F) + spectral_pos
-        input_dim = space_dim + field_dim * 3 + spectral_pos_dim
+        # window>0: coords(3) + macro_history(F) + dt(F) + dt2(F) + spectral_pos
+        # window=0: coords(3) + fields(F) + spectral_pos
+        n_feat = field_dim if self.no_temporal else field_dim * 3
+        input_dim = space_dim + n_feat + spectral_pos_dim
         self.preprocess = nn.Sequential(
             nn.Linear(input_dim, n_hidden * 2), nn.GELU(),
             nn.Linear(n_hidden * 2, n_hidden)
@@ -231,7 +240,8 @@ class HPM(nn.Module):
 
         self._init_weights()
         # Must come AFTER _init_weights to avoid trunc_normal_ overwriting
-        self._init_time_aggregator()
+        if not self.no_temporal:
+            self._init_time_aggregator()
 
     def _init_time_aggregator(self):
         """Initialize with exponential decay: recent frames get higher weight."""
@@ -287,11 +297,17 @@ class HPM(nn.Module):
         """
         B, N, _ = coords.shape
 
-        # Reshape fields: (B, N, W*F) -> (B, N, W, F)
-        fields_4d = fields.reshape(B, N, self.window, self.field_dim)
-
-        # Extract temporal features
-        temporal = self.extract_temporal_features(fields_4d)     # (B, N, 3F)
+        if self.no_temporal:
+            # 1b: fields 就是单帧 (B, N, F), 直接作为特征, 不做任何时间处理
+            assert fields.shape[-1] == self.field_dim, (
+                f"window=0 expects fields (B,N,{self.field_dim}), "
+                f"got {tuple(fields.shape)}")
+            temporal = fields                                    # (B, N, F)
+        else:
+            # Reshape fields: (B, N, W*F) -> (B, N, W, F)
+            fields_4d = fields.reshape(B, N, self.window, self.field_dim)
+            # Extract temporal features
+            temporal = self.extract_temporal_features(fields_4d)  # (B, N, 3F)
 
         # Build input: coords + temporal + optional spectral pos
         if self.spectral_pos_dim > 0:
