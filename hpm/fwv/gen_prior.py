@@ -14,70 +14,28 @@ gen_prior.py — 把 FUNWAVE lift 投射到 CFD 不规则网格 (cell 中心) �
 --------
 1. z 方向不插值: Nwogu 剖面在 z 上是解析的, 每个 cell 用它自己的 z_c 代入求值。
    全流程唯一的插值 = 水平面双线性 (bilinear), 且只在去重后的 (x,y) 上算一次。
-2. lift.py 一字不动 (纯度契约)。散点求值需要重写剖面公式, 故提供 --self-check
-   模式: 在 FUNWAVE 原生网格点上与 LC.lift_frame 逐点比对, 锁死重实现漂移。
+2. 分层: 剖面公式唯一实现在 lift.nwogu_at_points, 本文件只做工程层 ——
+   坐标 offset、水平双线性插值、(x,y) 去重、时间映射、chunk 循环、落盘。
+   FUNWAVE 文件读取在 fw_io.py。
 3. NaN (干单元 / 梯度扩散 / 域外 / 床下) -> 填 0, 同时记 valid=False。
    填 0 与 P 架构 (X̂ = prior + Δ) 天然兼容: prior 无效处退化为 X̂ = Δ。
 
 用法
 ----
-  # 一致性自检 (不需要 CFD 坐标, 建议先跑)
-  python gen_prior.py --fw-dir <fw>/output --self-check
-
-  # 生成 chunk 6 的 prior
   python gen_prior.py --fw-dir <fw>/output --coords <data>/coords.npy \\
       --gt-times <data>/chunk_006_times.npy --chunk 6 \\
-      --x-offset 15.05 --t-offset 0.0 --out <data>/prior
+      --x-offset 15.05 --t-offset 0.15 --out <data>/prior_t015
 """
 
 import argparse
-import glob
 import json
 import os
-import re
 import sys
 
 import numpy as np
 
-import lift as LC          # 只用 horizontal_terms / 常数; 不改动
-
-
-# ------------------------------------------------------------------ IO ------
-
-def read2d(path, mglob, nglob):
-    arr = np.loadtxt(path)
-    if arr.ndim == 1:
-        arr = arr[None, :]
-    if arr.shape == (nglob, mglob):
-        return arr
-    if arr.shape == (mglob, nglob):
-        return arr.T
-    raise ValueError(f"{path}: shape {arr.shape} (期望 {(nglob, mglob)})")
-
-
-class FrameCache:
-    """(eta,u,v) 帧缓存 —— p_nh 需要 n±1, 顺序推进时邻帧可复用。"""
-
-    def __init__(self, fw_dir, mglob, nglob, cap=6):
-        self.fw_dir, self.m, self.n, self.cap = fw_dir, mglob, nglob, cap
-        self._c = {}
-
-    def __call__(self, k):
-        if k in self._c:
-            return self._c[k]
-        fp = lambda v: os.path.join(self.fw_dir, f"{v}_{k:05d}")
-        eta = read2d(fp("eta"), self.m, self.n)
-        u = read2d(fp("u"), self.m, self.n)
-        v = read2d(fp("v"), self.m, self.n)
-        mp = fp("mask")
-        if os.path.exists(mp):
-            dry = read2d(mp, self.m, self.n) < 0.5
-            for f in (eta, u, v):
-                f[dry] = np.nan
-        while len(self._c) >= self.cap:
-            self._c.pop(next(iter(self._c)))
-        self._c[k] = (eta, u, v)
-        return self._c[k]
+import lift as LC              # 剖面公式与常数
+from fw_io import load_static  # FUNWAVE 文件读取
 
 
 # --------------------------------------------------- 水平双线性插值 (唯一插值) --
@@ -141,45 +99,6 @@ class Bilinear:
         return np.where(self.inside, out, np.nan)
 
 
-# ------------------------------------------- Nwogu 剖面 (散点版, 与 lift.py 同式) --
-
-def nwogu_at_points(z_c, eta, h, u, v, dAdx, dAdy, dBdx, dBdy, A, B,
-                    A_dot=None, B_dot=None):
-    """在散点上求值 3D 场。所有入参形状相同 (N,), z_c 为各点自己的高程。
-
-    公式与 lift.lift_frame 逐项一致 (由 --self-check 锁死):
-      Ux = u + (za - z)dAdx + 0.5(za^2 - z^2)dBdx        Nwogu 二次剖面
-      Uz = -(A + z B)                                     连续性
-      p  = rho g eta - rho[Ȧ(eta - z) + 0.5 Ḃ(eta^2 - z^2)]
-    返回 (N, 5), 通道序 lift.CH_NAMES; 空气区 U=p=0; 无定义处 NaN。
-    """
-    za = LC.BETA * h
-    water = z_c <= eta                      # eta 为 NaN 时 -> False, 后面统一置 NaN
-
-    Ux = u + (za - z_c) * dAdx + 0.5 * (za ** 2 - z_c ** 2) * dBdx
-    Uy = v + (za - z_c) * dAdy + 0.5 * (za ** 2 - z_c ** 2) * dBdy
-    Uz = -(A + z_c * B)
-
-    p = LC.RHO * LC.G * eta * np.ones_like(Ux)
-    if A_dot is not None and B_dot is not None:
-        p = p - LC.RHO * (A_dot * (eta - z_c)
-                          + 0.5 * B_dot * (eta ** 2 - z_c ** 2))
-
-    alpha = water.astype(np.float64)
-    air = ~water
-    for F in (Ux, Uy, Uz, p):
-        F[air] = 0.0
-
-    out = np.stack([alpha, Ux, Uy, Uz, p], axis=-1)
-
-    # 无定义: eta 为 NaN (干单元/域外/梯度扩散) -> 整点 NaN
-    bad = ~np.isfinite(eta)
-    # 床底以下同样无定义 (CFD 网格通常不含, 但仍显式处理)
-    bad |= np.isfinite(h) & (z_c < -h)
-    out[bad, :] = np.nan
-    return out
-
-
 # ------------------------------------------------------------ 单帧驱动 ------
 
 def build_frame(n_fw, cache, avail, h_grid, bil, z_c, inv, dx, dy, plot_intv,
@@ -211,182 +130,9 @@ def build_frame(n_fw, cache, avail, h_grid, bil, z_c, inv, dx, dy, plot_intv,
     ad = qA_dot[inv] if qA_dot is not None else None
     bd = qB_dot[inv] if qB_dot is not None else None
 
-    return nwogu_at_points(z_c, e["eta"], e["h"], e["u"], e["v"],
-                           e["dAdx"], e["dAdy"], e["dBdx"], e["dBdy"],
-                           e["A"], e["B"], A_dot=ad, B_dot=bd)
-
-
-# --------------------------------------------------------- 一致性自检 ------
-
-def check_bilinear(args):
-    """双线性插值器单测。原 self-check 的查询点落在网格节点上, 权重退化为
-    (1,0,0,0), 不经过插值路径 —— 故此处单独测。"""
-    print("-" * 60)
-    print("双线性插值器 (Bilinear) 单测")
-    print("-" * 60)
-    m, n, dx, dy = 40, 10, args.dx, args.dy
-    X, Y = np.meshgrid(np.arange(m) * dx, np.arange(n) * dy)
-    rng = np.random.default_rng(1)
-    xq = rng.uniform(0, (m - 1) * dx, 5000)
-    yq = rng.uniform(0, (n - 1) * dy, 5000)
-    bil = Bilinear(xq, yq, m, n, dx, dy)
-    ok = True
-
-    # 1) 线性场: 双线性应精确复现
-    F = 3.0 * X - 2.0 * Y + 1.5
-    e = np.abs(bil(F) - (3.0 * xq - 2.0 * yq + 1.5)).max()
-    ok &= e < 1e-12
-    print(f"  {'OK ' if e < 1e-12 else '!! '}线性场精确性     max|Δ|={e:.3e}")
-
-    # 2) 二次场: 截断误差应 <= dx^2/4
-    e2 = np.abs(bil(X ** 2) - xq ** 2).max()
-    bound = dx ** 2 / 4
-    ok &= e2 <= bound * 1.01
-    print(f"  {'OK ' if e2 <= bound*1.01 else '!! '}二次场截断误差   "
-          f"max|Δ|={e2:.3e}  理论上界={bound:.3e}")
-
-    # 3) NaN 传播: stencil 任一点 NaN -> 结果 NaN
-    F3 = F.copy(); F3[5, 20] = np.nan
-    q = Bilinear(np.array([0.395, 0.30]), np.array([0.10, 0.10]),
-                 m, n, dx, dy)(F3)
-    p3 = (not np.isfinite(q[0])) and np.isfinite(q[1])
-    ok &= p3
-    print(f"  {'OK ' if p3 else '!! '}NaN 传播          "
-          f"含NaN stencil -> {q[0]}, 远离处 -> {q[1]:.4f}")
-
-    # 3b) 零权重不传播 NaN (回归测试: 0.0*nan=nan 曾导致节点上查询被误伤)
-    #     查询点落在节点 19 上, 右邻节点 20 是 NaN 但权重为 0 -> 应取节点 19 的值
-    qz = Bilinear(np.array([19 * dx]), np.array([5 * dy]), m, n, dx, dy)(F3)
-    exp = F3[5, 19]
-    p3b = np.isfinite(qz[0]) and abs(qz[0] - exp) < 1e-12
-    ok &= p3b
-    print(f"  {'OK ' if p3b else '!! '}零权重不传播 NaN  "
-          f"节点上查询 -> {qz[0]} (期望 {exp})")
-
-    # 3c) 网格吸附 (回归测试): (i*dx)/dx 浮点误差曾使零权重变成 1e-15,
-    #     导致节点查询被右邻的 NaN 误伤。用真实网格规模复现。
-    M = 1575
-    Fs = np.zeros((n, M)); Fs[:, 1000:] = np.nan          # index 1000 起为 NaN
-    rs = Bilinear(np.arange(M) * dx, np.full(M, 5 * dy), M, n, dx, dy)(Fs)
-    first_nan = np.flatnonzero(~np.isfinite(rs))
-    p3c = len(first_nan) > 0 and first_nan.min() == 1000
-    ok &= p3c
-    print(f"  {'OK ' if p3c else '!! '}浮点吸附          "
-          f"NaN 起始 index={first_nan.min() if len(first_nan) else '无'} (期望 1000)")
-
-    # 4) 域外不外推
-    q2 = Bilinear(np.array([-0.01, (m - 1) * dx + 0.01]),
-                  np.array([0.05, 0.05]), m, n, dx, dy)(F)
-    p4 = not np.isfinite(q2).any()
-    ok &= p4
-    print(f"  {'OK ' if p4 else '!! '}域外不外推        {q2}")
-    return ok
-
-
-def self_check(args):
-    """在 FUNWAVE 原生网格点上, 把散点重实现与 LC.lift_frame 逐点比对。
-
-    构造 "假 CFD cell" = 原生网格点 (i,j) × 若干 z, 走完整散点路径,
-    再与 lift.lift_frame 的同位置输出作差。二者应完全一致 (浮点误差内)。
-    注意: 查询点落在节点上 -> 不经过插值路径, 故另有 check_bilinear 单测。
-    """
-    print("=" * 60)
-    print("一致性自检 (self-check): 散点重实现 vs lift.lift_frame")
-    print("=" * 60)
-
-    h_grid, avail, cache = load_static(args)
-
-    # 取一帧 (优先中间, 且需 n±1 可用)
-    ns = sorted(avail)
-    n = ns[len(ns) // 2]
-    if (n - 1) not in avail or (n + 1) not in avail:
-        n = ns[1]
-    print(f"[frame] fw#{n}")
-
-    # 参考: lift.lift_frame 在 (Nz, Ny, Nx) 上
-    z = np.linspace(args.z_min, args.z_max, args.check_nz)
-    eta_g, u_g, v_g = cache(n)
-    em, um, vm = cache(n - 1)
-    ep, up, vp = cache(n + 1)
-    Tm = LC.horizontal_terms(em, um, vm, h_grid, args.dx, args.dy)
-    Tp = LC.horizontal_terms(ep, up, vp, h_grid, args.dx, args.dy)
-    dt2 = 2.0 * args.plot_intv
-    A_dot_g = (Tp["A"] - Tm["A"]) / dt2
-    B_dot_g = (Tp["B"] - Tm["B"]) / dt2
-    ref = LC.lift_frame(eta_g, u_g, v_g, h_grid, args.dx, args.dy, z,
-                        A_dot=A_dot_g, B_dot=B_dot_g)      # (Nz,Ny,Nx,5)
-
-    # 散点路径: 把同样的 (i,j,z) 当成 CFD cell
-    ny, nx = args.nglob, args.mglob
-    jj, ii = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
-    x_fw = (ii * args.dx).ravel()
-    y_fw = (jj * args.dy).ravel()
-    n_xy = x_fw.size
-    z_rep = np.repeat(z, n_xy)                     # (Nz*n_xy,)
-    x_rep = np.tile(x_fw, len(z))
-    y_rep = np.tile(y_fw, len(z))
-
-    bil = Bilinear(x_rep, y_rep, args.mglob, args.nglob, args.dx, args.dy)
-    inv = np.arange(x_rep.size)                    # 不去重, 直接一一对应
-    got = build_frame(n, cache, avail, h_grid, bil, z_rep, inv,
-                      args.dx, args.dy, args.plot_intv, use_pnh=True)
-    got = got.reshape(len(z), ny, nx, 5)
-
-    # 比对 (NaN 位置也必须一致)
-    # 注: LC.lift_frame 末尾 .astype(np.float32), 故把散点结果也转 float32 再比,
-    #     否则会把 float32 舍入 (~1e-7 相对) 误判成公式漂移。
-    got = got.astype(np.float32)
-    TOL = 1e-6                                   # 数个 float32 ULP
-    ok = True
-    for c, name in enumerate(LC.CH_NAMES):
-        a, b = ref[..., c], got[..., c]
-        na, nb = ~np.isfinite(a), ~np.isfinite(b)
-        if not np.array_equal(na, nb):
-            print(f"  [{name}] NaN 位置不一致: ref {na.sum()} vs got {nb.sum()}")
-            ok = False
-            continue
-        m = ~na
-        if m.sum() == 0:
-            print(f"  [{name}] 全 NaN, 跳过")
-            continue
-        d = np.abs(a[m].astype(np.float64) - b[m].astype(np.float64))
-        scale = max(np.abs(a[m]).max(), 1e-30)
-        rel = d.max() / scale
-        flag = "OK " if rel < TOL else "!! "
-        if rel >= TOL:
-            ok = False
-        print(f"  {flag}[{name:6s}] max|Δ|={d.max():.3e}  "
-              f"rel={rel:.3e}  (n={m.sum()})")
-
-    print("=" * 60)
-    print("剖面公式: 通过 ✓" if ok else "剖面公式: 失败 ✗ —— 与 lift.py 有漂移")
-    ok_bil = check_bilinear(args)
-    print("=" * 60)
-    all_ok = ok and ok_bil
-    print("全部自检通过 ✓" if all_ok else "自检失败 ✗")
-    print("=" * 60)
-    return 0 if all_ok else 1
-
-
-# ------------------------------------------------------------ 静态加载 ------
-
-def load_static(args):
-    dep_path = os.path.join(args.fw_dir, "dep.out")
-    if not os.path.exists(dep_path):
-        cand = sorted(glob.glob(os.path.join(args.fw_dir, "dep*")))
-        if not cand:
-            sys.exit(f"[err] 找不到 dep 文件于 {args.fw_dir}")
-        dep_path = cand[0]
-    h_grid = read2d(dep_path, args.mglob, args.nglob)
-
-    avail = set(int(m.group(1)) for p in
-                glob.glob(os.path.join(args.fw_dir, "eta_*"))
-                if (m := re.search(r"eta_(\d+)$", os.path.basename(p))))
-    if not avail:
-        sys.exit(f"[err] {args.fw_dir} 下无 eta_* 帧")
-
-    cache = FrameCache(args.fw_dir, args.mglob, args.nglob)
-    return h_grid, avail, cache
+    return LC.nwogu_at_points(z_c, e["eta"], e["h"], e["u"], e["v"],
+                              e["dAdx"], e["dAdy"], e["dBdx"], e["dBdy"],
+                              e["A"], e["B"], A_dot=ad, B_dot=bd)
 
 
 # ---------------------------------------------------------------- main ------
@@ -394,8 +140,6 @@ def load_static(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fw-dir", required=True)
-    ap.add_argument("--self-check", action="store_true",
-                    help="只跑与 lift.lift_frame 的一致性自检, 不生成数据")
     # CFD 侧
     ap.add_argument("--coords", help="CFD cell 中心坐标 coords.npy (N,3) 物理坐标")
     ap.add_argument("--gt-times", help="对应 chunk 的 GT times npy (决定 t_cfd)")
@@ -407,7 +151,7 @@ def main():
     ap.add_argument("--y-offset", type=float, default=0.0,
                     help="y_fw = y_cfd + y_offset  (未验证, 默认 0)")
     ap.add_argument("--t-offset", type=float, default=None,
-                    help="t_fw = t_cfd + t_offset  [s] (需标定; 先用 0 做几何诊断)")
+                    help="t_fw = t_cfd + t_offset  [s] (scan_toffset.py 标定)")
     # FUNWAVE 网格
     ap.add_argument("--mglob", type=int, default=1575)
     ap.add_argument("--nglob", type=int, default=30)
@@ -415,21 +159,14 @@ def main():
     ap.add_argument("--dy", type=float, default=0.02)
     ap.add_argument("--plot-intv", type=float, default=0.05, dest="plot_intv")
     ap.add_argument("--no-pnh", action="store_true", help="关闭非静水 p_rgh 修正")
-    # 自检用
-    ap.add_argument("--z-min", type=float, default=-0.399772)
-    ap.add_argument("--z-max", type=float, default=0.147884)
-    ap.add_argument("--check-nz", type=int, default=12, dest="check_nz")
     args = ap.parse_args()
-
-    if args.self_check:
-        sys.exit(self_check(args))
 
     for req in ("coords", "gt_times", "chunk", "x_offset", "t_offset"):
         if getattr(args, req) is None:
-            sys.exit(f"[err] 生成模式必须显式给 --{req.replace('_', '-')}")
+            sys.exit(f"[err] 必须显式给 --{req.replace('_', '-')}")
 
     os.makedirs(args.out, exist_ok=True)
-    h_grid, avail, cache = load_static(args)
+    h_grid, avail, cache = load_static(args.fw_dir, args.mglob, args.nglob)
 
     # ---- CFD 坐标 -> FUNWAVE 坐标 ----
     coords = np.load(args.coords).astype(np.float64)

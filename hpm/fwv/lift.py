@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lift.py — 最 pure 的 lifting 算子本体。
+lift.py — 抬升算子 (lifting operator) 本体。
+
+把 FUNWAVE 的 2D 状态 (eta, u_a, v_a) 按 Nwogu (1993) 抬升为 3D 场。
 
 契约:
-  - 只做数学: Nwogu 二次剖面 + 连续性 W + Heaviside alpha + 静水/非静水 p_rgh
-  - 在 FUNWAVE 原生网格点上求值, 无插值、无平滑、无坐标偏移
+  - 只做数学: 水平项 A/B + Nwogu 二次剖面 + 连续性 W + Heaviside alpha
+    + 静水/非静水 p_rgh
+  - 无插值、无平滑、无坐标偏移 —— 这些属于工程层, 写在调用方
   - 唯一的离散操作: ∇A/∇B 的中心差分 (np.gradient) —— 算子定义内在需要
   - 干单元 (MASK=0) -> NaN, 不置零、不外推 —— 理论无定义处保持无定义
   - 零自由参数; alpha 恒为锐利 Heaviside
 
-若将来 generate 模式需要在 CFD 点取值 / 平滑 / offset, 那些属于工程层,
-写在调用方, 不进入本文件。
+分工:
+  horizontal_terms  在 FUNWAVE 原生网格上算 A、B 及其水平梯度
+  nwogu_at_points   在任意散点上求剖面 —— 每点用自己的 z, z 方向不插值
+
+调用方负责把 horizontal_terms 的输出插到目标点, 再喂给 nwogu_at_points。
+剖面公式在本仓库中只有这一份实现。
 """
 
 import numpy as np
@@ -38,51 +45,43 @@ def horizontal_terms(eta, u, v, h, dx, dy):
     )
 
 
-def lift_frame(eta, u, v, h, dx, dy, z,
-               A_dot=None, B_dot=None):
-    """把一帧 2D 状态提升为 3D 场 (在原生 x-y 网格 × 给定 z 轴上)。
+def nwogu_at_points(z_c, eta, h, u, v, dAdx, dAdy, dBdx, dBdy, A, B,
+                    A_dot=None, B_dot=None):
+    """在散点上求值 3D 场。所有入参形状相同 (N,), z_c 为各点自己的高程。
 
-    参数
-      eta, u, v : (Ny, Nx)  自由面 / u_alpha / v_alpha, 干单元应为 NaN
-      h         : (Ny, Nx)  静水深 (正值)
-      z         : (Nz,)     求值高程
-      A_dot, B_dot : (Ny, Nx) 或 None —— A、B 的时间导数 (由调用方用相邻帧
-                     中心差分提供)。None 时 p_rgh 退化为纯静水项。
+      Ux = u + (za - z)dAdx + 0.5(za^2 - z^2)dBdx      Nwogu 二次剖面
+      Uy = v + (za - z)dAdy + 0.5(za^2 - z^2)dBdy
+      Uz = -(A + z B)                                   连续性
+      p  = rho g eta - rho[Adot(eta - z) + 0.5 Bdot(eta^2 - z^2)]
+           A_dot / B_dot 为 None 时退化为纯静水 rho g eta
 
-    返回 (Nz, Ny, Nx, 5), 通道序 CH_NAMES。空气区 U=V=W=0 (Design 2 αU 约定),
-    p_rgh 空气区为 0。干单元整柱 NaN。
+    剖面对 z 是解析的, 故直接代入各点自己的 z —— 无论目标网格规则与否,
+    全程不做 z 方向插值。规则网格的用法是把它摊平成散点后 reshape 回去。
+
+    返回 (N, 5), 通道序 CH_NAMES; 空气区 U=p=0; 无定义处整点 NaN。
     """
-    T = horizontal_terms(eta, u, v, h, dx, dy)
-    za = BETA * h                                   # (Ny, Nx)
-    zc = z[:, None, None]                           # (Nz, 1, 1)
+    za = BETA * h
+    water = z_c <= eta                      # eta 为 NaN 时 -> False, 后面统一置 NaN
 
-    water = zc <= eta[None]                         # (Nz, Ny, Nx)
-    alpha = water.astype(np.float32)
+    Ux = u + (za - z_c) * dAdx + 0.5 * (za ** 2 - z_c ** 2) * dBdx
+    Uy = v + (za - z_c) * dAdy + 0.5 * (za ** 2 - z_c ** 2) * dBdy
+    Uz = -(A + z_c * B)
 
-    # Nwogu 二次剖面: u(z) = u_a + (za - z) ∇A + ½(za² - z²) ∇B
-    Ux = u[None] + (za[None] - zc) * T["dAdx"][None] \
-        + 0.5 * (za[None] ** 2 - zc ** 2) * T["dBdx"][None]
-    Uy = v[None] + (za[None] - zc) * T["dAdy"][None] \
-        + 0.5 * (za[None] ** 2 - zc ** 2) * T["dBdy"][None]
-    # 连续性: W(z) = -[A + z B]
-    Uz = -(T["A"][None] + zc * T["B"][None])
-
-    # p_rgh: 静水扰动 ρgη + 非静水修正 (仅当提供 Ȧ, Ḃ)
-    p = RHO * G * eta[None] * np.ones_like(Ux)
+    p = RHO * G * eta * np.ones_like(Ux)
     if A_dot is not None and B_dot is not None:
-        p = p - RHO * (A_dot[None] * (eta[None] - zc)
-                       + 0.5 * B_dot[None] * (eta[None] ** 2 - zc ** 2))
+        p = p - RHO * (A_dot * (eta - z_c)
+                       + 0.5 * B_dot * (eta ** 2 - z_c ** 2))
 
+    alpha = water.astype(np.float64)
     air = ~water
     for F in (Ux, Uy, Uz, p):
         F[air] = 0.0
 
-    out = np.stack([alpha, Ux, Uy, Uz, p], axis=-1).astype(np.float32)
+    out = np.stack([alpha, Ux, Uy, Uz, p], axis=-1)
 
-    # 干单元: eta 为 NaN -> 整柱 NaN (含 alpha), 诚实标注无定义区
-    dry = ~np.isfinite(eta)
-    out[:, dry, :] = np.nan
-    # 床底以下同样无定义
-    below_bed = zc < (-h)[None]
-    out[below_bed] = np.nan
+    # 无定义: eta 为 NaN (干单元/域外/梯度扩散) -> 整点 NaN
+    bad = ~np.isfinite(eta)
+    # 床底以下同样无定义 (CFD 网格通常不含, 但仍显式处理)
+    bad |= np.isfinite(h) & (z_c < -h)
+    out[bad, :] = np.nan
     return out
