@@ -7,7 +7,8 @@ gen_prior.py — 把 FUNWAVE lift 投射到 CFD 不规则网格 (cell 中心) �
     prior_{cid:03d}_data.npy    (T, N_cells, 5)  float32
     prior_{cid:03d}_valid.npy   (T, N_cells)     bool   [诊断用, 非训练输入]
     prior_{cid:03d}_times.npy   (T,)  t_cfd [s]
-    prior_meta.json             offset / 参数 / valid 统计 (自描述)
+    prior_{cid:03d}_meta.json   offset / 参数 / valid 统计 (自描述)
+                                逐 chunk 一份 —— array 并行下共用一个文件会串。
 通道序: [alpha, Ux, Uy, Uz, p_rgh]   (与 lift.CH_NAMES 一致; 无 nut)
 
 关键设计
@@ -275,8 +276,8 @@ def main():
                 dry_x_max=float(dry_x.max()) if dry_cells.any() else None,
                 horiz_points_outside_grid=n_out,
                 frames_missing=len(missing))
-    with open(os.path.join(args.out, "prior_meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    with open(os.path.join(args.out, f"prior_{cid}_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
     print()
     print("=" * 60)

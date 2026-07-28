@@ -5,17 +5,18 @@
 # ============================================================
 data:
   dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05
-  prior_dir: ${oc.env:HOME}/hpc-share/models/data/3d/prior_t015
+  # 逐 chunk t-offset 标定后重新生成 (fwv/toffset_scan/c00*.json -> gen_prior.sh)。
+  # 旧的固定 t=0.15 版本在 .../3d/prior_t015, 保留作对照 arm。
+  prior_dir: ${oc.env:HOME}/hpc-share/models/data/3d/cropped_0.05/prior_ktuned
 
-  # chunk 9 的 prior 已失效 (raw 空间 Uz nRMSE=1.02 > 1, 即 prior 比常数基线
-  # 还差; 冒烟实测同样是 1.021)。用它选 best.pt 等于让模型去优化一个 prior
-  # 已经不成立的 chunk。故 val 用 chunk 8, chunk 9 留作最终测试、不参与选择。
-  # 若要沿用 train 1-8: data.train_chunk_range=[1,8] data.val_chunk_range=[9]
+  # chunk 9 的 prior 此前失效 (固定 offset 下 raw 空间 Uz nRMSE=1.02 > 1)。
+  # 逐 chunk 标定发现它的最优 k=+6 而非 +3 —— 那是配准误差, 不是数据问题。
+  # 重新生成后 Uz nRMSE=0.957 < 1, chunk 9 已是有效 test chunk。
+  # 划分仍保持 train 1-7 / val 8 / test 9 (与旧 arm 可比, 单变量)。
   train_chunk_range: [1, 7]
   val_chunk_range: [8]
   # 仅供最终评估 / 可视化, 不参与训练与模型选择。
-  # chunk 9 的 prior 已失效 (Uz nRMSE=1.02), 看它是为了确认失效的表现形态,
-  # 不是拿它当性能指标。chunk 10 数据损坏 (GT 只有 1 帧), 不可用。
+  # chunk 10 数据损坏 (GT 只有 1 帧), 不可用。
   test_chunk_range: [9]
 
   # window=0 : 无时间特征。模型只看当前帧 prior ->
@@ -23,21 +24,23 @@ data:
   window: 0
 
   # ------------------------------------------------------------
-  # 只保留有有效 prior 的通道。依据 diag_prior.py (10 chunk, raw 空间):
-  #   通道    nRMSE_prior   判定
-  #   alpha      0.42       有效
-  #   Ux         0.92       弱有效
-  #   Uz         0.96       弱有效
-  #   p_rgh      0.69       有效
-  #   Uy         1.01       无效 —— corr ~= 0, 比常数基线还差, prior 在加噪
-  #   nut         --        FUNWAVE 无湍流模型, 结构上没有 prior
+  # 只保留有有效 prior 的通道。依据 fwv/diag_prior.py
+  # (chunk 1-9, prior_ktuned, raw 空间, 跨 chunk 均值):
+  #   通道    nRMSE_prior   corr     判定
+  #   alpha      0.410      0.918    有效
+  #   p_rgh      0.647      0.806    有效
+  #   Ux         0.896      0.521    弱有效
+  #   Uz         0.930      0.403    弱有效
+  #   Uy         1.002     -0.001    无效 —— corr ~= 0, 比常数基线还差, prior 在加噪
+  #   nut         --         --      FUNWAVE 无湍流模型, 结构上没有 prior
   # Uy / nut 在 1b 下必须 disabled: 它们没有可用 base, 而 1b 没有自反馈路径。
   #
-  # alpha_weighted 全 false —— 与现行 config.yaml 一致 (单变量原则: 1b 已经
-  # 改了通道数/时间建模/base, 不再叠加空间变换)。
-  # αU 空间下 prior 匹配更好 (Ux 0.92->0.80, Uz 0.96->0.89), 但那是因为
-  # prior 空气区恒为 0 而 CFD 气相有速度 —— 乘 alpha 把这块空间定义差异压掉,
-  # 是掩盖而非解决。作为第二个 arm 单独测: 只翻 Ux/Uz 的 alpha_weighted。
+  # alpha_weighted 全 false —— 单变量原则: 1b 已经改了通道数/时间建模/base,
+  # 不再叠加空间变换。
+  # αU 空间下 prior 匹配明显更好 (Ux 0.896->0.749 corr 0.52->0.71,
+  # Uz 0.930->0.809 corr 0.40->0.66), 但那是因为 prior 空气区恒为 0 而 CFD
+  # 气相有速度 —— 乘 alpha 把这块空间定义差异压掉, 是掩盖而非解决。
+  # 作为第二个 arm 单独测: 只翻 Ux/Uz 的 alpha_weighted。
   # ------------------------------------------------------------
   channels:
     - {name: alpha, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
@@ -79,5 +82,8 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  # 手动命名 (不走 autoname): 1b 与现有 schema 消融不在同一命名空间
-  name: hpm_prior1b_h128
+  # 手动命名 (不走 autoname): fw 分支与现有 schema 消融不在同一命名空间。
+  # fw     = FUNWAVE prior 分支
+  # ktuned = 逐 chunk 标定的 t-offset (旧的固定 offset 版是 hpm_prior1b_h128)
+  # 两者只差 prior_dir 一个变量, 可直接对照。
+  name: hpm_fw_ktuned_h128
