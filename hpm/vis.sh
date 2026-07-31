@@ -1,12 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=vis
-#SBATCH --partition=preempt
+#SBATCH --partition=ampere
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=l40s
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=03:00:00
-#SBATCH --output=/nfs/hpc/share/baoh/models/hpm/logs/hpm_vis_%j.log
+#SBATCH --output=logs/hpm_vis_%j.log
 
 cd ~/hpc-share/models/hpm
 
@@ -21,7 +20,7 @@ conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
 #      最新一次训练（按 best.pt 修改时间 = 最近训练活动）
 #   3. 留空:      ""                                        -> 全局最新一次训练
 # ============================================================
-TIMEPOINT="hpm_no-nut_h128"
+TIMEPOINT="${TIMEPOINT:-hpm_no-nut_h128}"
 
 # 可选项：输出目录名。不改则默认从解析后的 TIMEPOINT 派生（唯一、不冲突）。
 FEATURE="${FEATURE:-}"

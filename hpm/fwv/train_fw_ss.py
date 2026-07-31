@@ -195,6 +195,9 @@ def main(cfg: DictConfig):
     print(f"scheduled sampling: p {p_start} -> {p_end}, 退火占前 "
           f"{anneal_frac*100:.0f}% epochs  (p = 喂 GT 概率)")
     print(f"每样本 = 连续 {R} 帧; 序列第 0 步恒冷启动 m=0; 真 BPTT (喂 pred 保链)")
+    print("注意: ss 版**不使用** cond_dropout —— cold start 由每序列 r=0 强制 "
+          "m=0 结构处理 (约 1/R 的 step 为冷启动)。config 里的 cond_dropout "
+          "是 train_fw.py(单步版)的活参数, 在此为死参数, 不参与训练。")
 
     spectral_embedding = np.load(Path(cfg.data.dir) / "lbo" / "lbo_eigenvectors.npy")
     print(f"LBO eigenvectors: {spectral_embedding.shape}")

@@ -19,6 +19,12 @@
 #   sbatch --array=1-9%3 fwv/gen_prior.sh      限制同时最多 3 个 (省配额)
 #   TOFF=0.15 sbatch fwv/gen_prior.sh          强制统一 t-offset (跳过逐 chunk 查表)
 #
+#   LONGTERM=1 sbatch --array=10 fwv/gen_prior.sh   long-term rollout 用:
+#       无 GT、只定性看 rollout 长期表现。自己生成 times (fw 帧 FSTART..FEND
+#       × plot_intv 的绝对时间), 强制 TOFF=0 (帧号即时间, 不平移), 跳过 scan。
+#       默认 FSTART=1000 FEND=1999 (50.00..99.95s, 1000 帧)。
+#       ⚠️ 覆盖 chunk10 (旧废 chunk); gen_prior.py 不改, 只在此生成临时 times。
+#
 # 参数来源:
 #   x-offset 15.05  教授域图 + Xc_WK(6.35) <-> CFD startX(-8.7) 双重确认
 #   t-offset        **逐 chunk**, 从 fwv/toffset_scan/c{CID}.json 的 best_k 读。
@@ -48,6 +54,28 @@ export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 
 CID=$(printf "%03d" "${CHUNK}")
+
+# ============================================================
+# LONGTERM 分支: long-term rollout 用 (无 GT, 定性看长期表现)
+#   - 自己生成 chunk_{CID}_times.npy = fw 帧 FSTART..FEND 的绝对时间
+#   - 强制 TOFF=0 (times 已是绝对帧时间, n_fw = t/plot_intv = FSTART..FEND)
+#   - 跳过 scan 查表 (没有 GT, 不对齐任何东西)
+#   gen_prior.py 一字不改 —— 它照常读 --gt-times, 只是这份 times 是我们造的。
+# ============================================================
+if [ "${LONGTERM}" = "1" ]; then
+    FSTART=${FSTART:-1000}
+    FEND=${FEND:-1999}
+    PLOT=${PLOT:-0.05}
+    echo "[longterm] fw 帧 ${FSTART}..${FEND}  (plot_intv=${PLOT}) -> 自造 times"
+    python -c "
+import numpy as np
+t = np.arange(${FSTART}, ${FEND}+1) * ${PLOT}
+np.save('${DATA}/chunk_${CID}_times.npy', t)
+print(f'[longterm] chunk ${CID} times: {t[0]:.2f}..{t[-1]:.2f}s, {len(t)} frames')
+" || { echo 'ERROR: 生成 times 失败'; exit 1; }
+    TOFF=0                       # 帧号即绝对时间, 不平移
+    echo "[longterm] 强制 TOFF=0, 跳过 scan 查表"
+fi
 
 # ---- t-offset: 逐 chunk 查表 (TOFF 未显式给定时) ----
 # fail loud: scan 结果缺失或 best_k 为 null 就退出, 不静默回落到某个默认值 ——

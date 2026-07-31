@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -225,19 +226,28 @@ def main():
     data = np.zeros((T, N, 5), dtype=np.float32)
     valid = np.zeros((T, N), dtype=bool)
 
+    t_lift = 0.0          # build_frame 累计耗时 (纯 lift 计算, 不含读盘/落盘)
+    n_lift = 0            # 实际算过 build_frame 的帧数 (跳过 missing)
+
     for i, k in enumerate(n_fw):
         k = int(k)
         if k not in avail:
             continue                       # data 保持 0, valid 保持 False
+        t0 = time.perf_counter()
         out = build_frame(k, cache, avail, h_grid, bil, z_c, inv,
                           args.dx, args.dy, args.plot_intv,
                           use_pnh=not args.no_pnh)
+        t_lift += time.perf_counter() - t0
+        n_lift += 1
         fin = np.isfinite(out).all(axis=1)
         out[~fin, :] = 0.0                 # NaN -> 0 (与 P 架构兼容)
         data[i] = out.astype(np.float32)
         valid[i] = fin
         if i % 10 == 0:
             print(f"  {i+1}/{T}  fw#{k}  valid {fin.mean()*100:.2f}%", flush=True)
+
+    print(f"[lift] build_frame {n_lift} 帧累计 {t_lift:.1f}s, "
+          f"均值 {t_lift/max(n_lift,1)*1000:.1f} ms/帧  ({N} cells)")
 
     # ---- 落盘 ----
     cid = f"{args.chunk:03d}"
