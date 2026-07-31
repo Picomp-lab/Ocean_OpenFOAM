@@ -31,7 +31,7 @@
 CHUNK=${1:-6}
 STITCH=${STITCH:-0}
 GT_DIR=${GT_DIR:-/nfs/stak/users/baoh/hpc-share/models/hpm/vis/gt_alpha}
-OUT_DIR=${OUT_DIR:-vis_lift_case2}
+OUT_DIR=${OUT_DIR:-fwv/vis_lift}
 
 cd ~/hpc-share/models/hpm
 mkdir -p logs "${OUT_DIR}"

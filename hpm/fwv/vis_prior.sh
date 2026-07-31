@@ -64,7 +64,7 @@ for f in "$CONFIG" "$CKPT"; do
 done
 
 FEATURE="${FEATURE:-$(echo "$TIMEPOINT" | tr '/' '_')}"
-OUTDIR="vis_prior/${FEATURE}"
+OUTDIR="fwv/vis_prior/${FEATURE}"
 
 # ---- FIELDS / CHUNKS 从 config 推导 ----
 # FIELDS = WANTED ∩ schema (Umag 特判放行)
