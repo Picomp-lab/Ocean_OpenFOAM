@@ -36,7 +36,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from omegaconf import OmegaConf
 
 from dataset import expand_range, load_chunk, load_coords, resolve_stats
-from hpm_model import HPM
+from hpm_fwv import HPM, strip_legacy_basis
 from prior_ext import assert_prior_compatible, load_prior
 from schema import ChannelSchema
 
@@ -95,7 +95,7 @@ def main():
         spectral_embedding=spectral_embedding, use_ckpt=False,
     ).to(device)
     ck = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ck["model"]); model.eval()
+    model.load_state_dict(strip_legacy_basis(ckpt["model"]), strict=True); model.eval()
     print(f"Loaded checkpoint (epoch {ck.get('epoch','?')}, "
           f"best_val {ck.get('best_val', float('nan')):.6f})")
 

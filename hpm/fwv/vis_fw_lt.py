@@ -35,7 +35,7 @@ import matplotlib.tri as mtri
 from matplotlib.colors import LinearSegmentedColormap
 from omegaconf import OmegaConf
 
-from hpm_model import HPM                                   # 父 hpm/
+from hpm_fwv import HPM, strip_legacy_basis                 # 父 hpm/
 from schema import ChannelSchema                            # 父 hpm/
 from dataset import load_coords, resolve_stats, expand_range  # 父 hpm/
 from prior_ext import load_prior                            # fwv/
@@ -95,7 +95,7 @@ def main():
         max_grad_norm=cfg.train.get('max_grad_norm', 0.0),
     ).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(strip_legacy_basis(ckpt["model"]), strict=True)
     model.eval()
 
     # ---- field 解析 (无 Umag 分支, long-term 先只标量场) ----

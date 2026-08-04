@@ -49,7 +49,7 @@ except ImportError:
     HAS_WANDB = False
 
 from dataset import expand_range, load_coords, resolve_stats    # 父 hpm/
-from hpm_model import HPM                                       # 父 hpm/
+from hpm_fwv import HPM, strip_legacy_basis                    # fwv/
 from prior_ext import assert_prior_compatible                  # fwv/
 from schema import ChannelSchema                               # 父 hpm/
 
@@ -252,7 +252,8 @@ def main(cfg: DictConfig):
     latest_path = save_dir / "latest.pt"
     if latest_path.exists():
         ck = torch.load(latest_path, map_location=device, weights_only=False)
-        model.load_state_dict(ck['model']); optimizer.load_state_dict(ck['optimizer'])
+        model.load_state_dict(strip_legacy_basis(ck['model']), strict=True)
+        optimizer.load_state_dict(ck['optimizer'])
         scheduler.load_state_dict(ck['scheduler'])
         start_epoch = ck['epoch'] + 1; best_val = ck.get('best_val', float('inf'))
         print(f"Resumed from epoch {start_epoch}, best_val={best_val:.6f}")
