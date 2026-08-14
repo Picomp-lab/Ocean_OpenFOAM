@@ -1,0 +1,194 @@
+# ============================================================
+# config.yaml — 唯一配置文件。
+#
+# 两条模型线由 data.window 单参数区分:
+#   window == 0   HPM + FUNWAVE (fwv)   残差加在 prior(t) 上   ← 默认, 当前主力
+#   window >= 3   纯 HPM (pure HPM)     残差加在自己上一帧      前一阶段, 已完成
+# 二者不是自由组合: window>0 才有历史帧可作基座, window=0 则没有。
+#
+# ------------------------------------------------------------
+# 复现表 (REPRODUCTION TABLE) —— 每个跑过的 run 一行
+# ------------------------------------------------------------
+#  run 名                    命令
+#  --------------------------------------------------------------------------
+#  hpm_fw_aU_h128            python train.py
+#      默认配置 = prior + 自反馈 + SS(R=4) + αU 加权。**当前最佳臂**。
+#      判据是可视化结果 (近岸形态), 不是 val nRMSE —— 见下方 "αU 的比较陷阱"。
+#
+#  hpm_fw_h128               python train.py data.channels.1.alpha_weighted=false \
+#                                            data.channels.3.alpha_weighted=false
+#      非 αU 变体 (速度通道不乘 alpha)。
+#
+#  hpm_fw_nofb_h128          python train.py rollout.feedback=none rollout.R=1 \
+#                                data.channels.1.alpha_weighted=false \
+#                                data.channels.3.alpha_weighted=false
+#      无反馈基线; 纯 "prior 场 -> CFD 场" 单步映射, 无 rollout 无冷启动。
+#      (历史上跑过的这一支是非 αU 的, 故显式关掉; 想要 αU 版就去掉后两行,
+#       名字会变成 hpm_fw_nofb_aU_h128)
+#
+#  --- 纯 HPM 线 (前一阶段, 不再迭代) ---
+#  切过去要带四组参数 (窗口 / 反馈 / SS / 通道):
+#      data.window=6 rollout.feedback=none rollout.ss=false
+#      data.channels.1.alpha_weighted=false data.channels.3.alpha_weighted=false
+#      data.channels.2.enabled=true data.channels.5.enabled=true
+#  单 yaml 的代价, 但显式。run.sh 已封成 `./run.sh pure ...`, 不必手抄;
+#  忘带 rollout.ss=false 会被 build_policy 断言拦住, 不会静默跑成别的东西。
+#    hpm_bl_h128       ./run.sh pure
+#    nut frozen        ./run.sh pure data.channels.5.update_rule=frozen \
+#                                    data.channels.5.loss_weight=0.0
+#    nut disabled      ./run.sh pure data.channels.5.enabled=false
+#
+# ------------------------------------------------------------
+# αU 的比较陷阱 (读 nRMSE 前必看)
+# ------------------------------------------------------------
+# αU 与非 αU 的 nRMSE **不在同一个空间**, 不能直接比大小:
+#   αU     stats_c1-7_alpha.Uxw.Uzw.p_rgh.npy   Ux 的 Δ=0 基线 0.619
+#   非 αU  stats_c1-7_alpha.Ux.Uz.p_rgh.npy     Ux 的 Δ=0 基线 0.896
+# 归一化的量本身换了 (αUx vs Ux), 分母不同。stats 文件名带 'w' 后缀就是这个
+# 原因 (schema.signature())。跨臂比较只能用共同空间的指标 —— `vis.py pred` 输出的
+# raw 空间 slice-RMSE, 或分区域的近岸形态。
+#
+# 另注: 当前 config 未固定随机种子。同配置重跑 best_val 有 ~2% 抖动
+# (实测 0.1549 vs 0.1512), 且刷新出现的 epoch 会大幅移动。
+#
+# ------------------------------------------------------------
+# 纪律: 改这个文件 = **定义新 baseline**; 跑变体走 CLI 覆盖。
+#   CLI 覆盖会自动进 hydra 目录名与 wandb run 名 (override_dirname), 改 yaml
+#   不会 —— 所以 rollout.R=4 与 R=8 若都靠改 yaml, 两次 run 会同名。
+# ------------------------------------------------------------
+data:
+  dir: ${repo:}/data/3d/cropped_0.05
+  # 逐 chunk t-offset 标定后重新生成 (toffset_scan/c00*.json -> gen_prior.sh)。
+  # best_k[1..9] = [1,3,5,5,4,3,2,4,6] —— 非单调, 所以没有"漂移模型"可套,
+  # 只能逐 chunk 标。window>0 (纯 HPM) 时本项被忽略。
+  prior_dir: ${repo:}/data/3d/cropped_0.05/prior_ktuned
+
+  # chunk range: [single] 或 [start, end] (闭区间)
+  # chunk 9 的 prior 此前失效 (固定 offset 下 raw 空间 Uz nRMSE=1.02 > 1)。逐
+  # chunk 标定发现最优 k=+6 而非 +3 —— 那是配准误差, 不是数据问题。重新生成后
+  # Uz nRMSE=0.957 < 1, chunk 9 已是有效 test chunk。
+  train_chunk_range: [1, 7]
+  val_chunk_range: [8]
+  test_chunk_range: [9]
+
+  # 0 -> fwv 线 (基座 = prior);  >=3 -> 纯 HPM (基座 = 窗口末帧, 需要有限差分)
+  window: 0
+
+  # ============================================================
+  # Channel schema — SINGLE SOURCE OF TRUTH (见 schema.py)。
+  # 这里的顺序 == 张量通道顺序。其余全部派生: field_dim, out_dim, loss 权重,
+  # alpha 加权, stats 文件名。
+  #
+  #   enabled:        false = 该通道对模型完全不存在 (非输入、无 head、无 stats、
+  #                   不计入 field_dim)。'alpha' 不可 disable。
+  #   update_rule:    delta  = 由 delta head 预测
+  #                   frozen = 仍是输入, rollout 中原样携带, 无 head 无 loss
+  #                   flux_div = 预留给 flux head, 未实现 (会抛 NotImplementedError)
+  #   loss_weight:    z-normalized delta 空间的逐通道 MSE 权重 (相对重要性,
+  #                   非物理量纲)。影响梯度 **和** val_loss (即 best.pt 选择)。
+  #                   绝不要 update_rule=delta 配 loss_weight=0.0 ——
+  #                   无监督的 head 会污染 rollout; 用 frozen 或 enabled:false。
+  #   alpha_weighted: 物理空间内乘以 alpha (水相体积分数)
+  #
+  # 下面的开关状态针对 fwv 线。通道取舍依据 diag_prior.py
+  # (chunk 1-9, prior_ktuned, raw 空间, 跨 chunk 均值):
+  #   通道    nRMSE_prior   corr     判定
+  #   alpha      0.410      0.918    有效
+  #   p_rgh      0.647      0.806    有效
+  #   Ux         0.896      0.521    弱有效
+  #   Uz         0.930      0.403    弱有效
+  #   Uy         1.002     -0.001    无效 —— corr≈0, 比常数基线还差, prior 在加噪
+  #   nut         --         --      FUNWAVE 无湍流模型, 结构上没有 prior
+  #
+  # Ux / Uz 的 alpha_weighted=true 是当前最佳臂。跑纯 HPM 线时应关掉 (那条线
+  # 没有 prior, αU 的动机不成立), run.sh 的 `pure` 已代劳。
+  # ============================================================
+  channels:
+    - {name: alpha, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Ux,    enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: true}
+    - {name: Uy,    enabled: false, update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: Uz,    enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: true}
+    - {name: p_rgh, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
+    - {name: nut,   enabled: false, update_rule: delta, loss_weight: 0.1, alpha_weighted: false}
+
+# ------------------------------------------------------------
+# rollout — 三个可变轴 (基座轴由 data.window 推导, 不在这里)
+# ------------------------------------------------------------
+rollout:
+  # none | self  —— 自反馈槽, 仅 fwv 线支持 (纯 HPM 的窗口本身已是状态)
+  #   none  输入 = [prior],         F 通道
+  #   self  输入 = [prior | x_f*m], 2F 通道; 屏蔽由 x_f*m 完成 (算术恒等)
+  feedback: self
+
+  R: 4          # rollout 展开步数 (真 BPTT; 序列内严格顺序, 序列间随机起点)
+
+  # scheduled sampling 总开关。false -> p 恒 0 (全自回归 = 部署条件),
+  # 下面三个 p_* 全部忽略。开关只在 train.py main 里生效一次。
+  # 纯 HPM 线**必须** ss=false (那条线的历史行为是恒喂 pred); build_policy
+  # 会断言, 只写 data.window=6 而忘了关会直接失败而不是静默出错数。
+  ss: true
+
+  # SS 的退火参数 (仅 ss=true 时生效)。p = 喂 GT 的概率, 治 exposure bias。
+  #   p=1 teacher forcing (断链)   p=0 全自回归 = 部署条件 (保链)
+  # val 恒 p=0, 与部署一致。R=1 时 p 不起作用 (没有 r>=1 的步)。
+  p_start: 1.0
+  p_end: 0.1
+  anneal_frac: 0.6      # 退火占 epochs 的比例; <=0 表示恒 p_end
+
+model:
+  n_hidden: 128
+  n_layers: 6
+  n_heads: 8
+  freq_num: 64
+  dropout: 0.1
+  mlp_ratio: 2
+  spectral_pos_dim: 0
+  use_ckpt: true
+
+train:
+  batch_size: 1
+  lr: 5e-4
+  weight_decay: 1e-4
+  # 注: 50 epoch x ~1780s ≈ 24.7h, 会撞 SLURM 24h 墙 (实测两次都停在 epoch 47)。
+  # 末 15 个 epoch 已平, 降到 30 可跑完且不损失 —— 暂未改, 待定。
+  epochs: 50
+  max_grad_norm: 1.0
+  num_workers: 4
+
+hydra:
+  job:
+    config:
+      # CLI 覆盖自动进入目录名与 wandb 运行名 (超参 diff 的自动编码)。
+      # 与 runname 互补: runname 管模型线 + schema diff, 这里管超参 diff。
+      override_dirname:
+        exclude_keys: [wandb.enabled, wandb.name, wandb.name_suffix,
+                       train.num_workers]
+        kv_sep: '-'
+        item_sep: '_'
+  run:
+    dir: ${repo:}/results/train/${wandb.name}/${hydra.job.override_dirname}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${repo:}/results/train/${wandb.name}/${hydra.job.override_dirname}/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+save:
+  dir: ${hydra:runtime.output_dir}/checkpoints
+
+wandb:
+  enabled: true
+  project: hpm-wave
+  # 运行名自动派生 (train.py run_name):
+  #   window>0 -> schema.auto_run_name    hpm_bl_h128 / hpm_no-nut_h128
+  #   window=0 -> hpm_fw[_nofb][_aU|_aUx|_aUz]_h{n}
+  #
+  # 名字只编码**相对默认配置的 diff**:
+  #   nofb    关掉自反馈 (默认 self)
+  #   aU 系列 列出被 alpha 加权的速度通道 —— 与纯 HPM 线同向 (加权了才显示):
+  #             Ux+Uz -> aU    只 Ux -> aUx    只 Uz -> aUz    都没有 -> 省略
+  #   h{n}    模型容量常驻 (将来要横向比较的一列, 埋进 override_dirname 不好认)
+  # R / lr 等超参不在这里编码 —— 走 CLI 时 override_dirname 已经追加了,
+  # 例如 rollout.R=8 -> hpm_fw_aU_h128_rollout.R-8
+  # 手动覆盖: python train.py wandb.name=custom
+  # 加尾标:   python train.py wandb.name_suffix=lr5e4
+  name: ${runname:}
+  name_suffix: ""
