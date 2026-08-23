@@ -1,0 +1,72 @@
+# 大文件清单 —— 这些东西不进版本库，放在云端硬盘。
+#
+# archive/ 一个目录装三样东西:
+#   restore.sh    还原器            进版本库
+#   *.manifest    各包的逐文件校验单  进版本库，clone 就有，所以拿到包不用先问人
+#                                   「这包怎么解、解出来对不对」
+#   *.tar         包本体            不进版本库，从云端硬盘下载后**直接放这里**。
+#                                   换地方放就 export OCEAN_ARCHIVE=/path
+#
+# 下载后跑 ./setup.sh 或 ./archive/restore.sh 解压（两者区别见下）。
+#
+# 为什么不进版本库: 视频和 checkpoint 加起来近 1 G，git 存二进制不会 delta 压缩，
+# 每改一版就整份再存一遍，仓库会无限膨胀。代码 clone 应该是秒级的。
+#
+# 制作方式（在 models/ 下，路径相对仓库根，所以解压时 -C 到仓库根即可）:
+#   tar -cf archive/<名字>.tar <目录>
+#   find <目录> -type f -print0 | sort -z | xargs -0 md5sum > archive/<名字>.manifest
+#   （8 G 级别的别在登录节点打，丢 sbatch 到 share 分区）
+#
+# 列（TAB 分隔，共 6 列）:
+#   1 文件名      云端硬盘上的文件名，也是本地缓存的文件名
+#   2 解压到      相对仓库根的目录，给 tar -C 用；"." = 仓库根
+#   3 探测路径    相对仓库根；这个路径存在且非空 = 已就位，setup.sh 会跳过
+#   4 大小        人可读，仅供提示
+#   5 md5         下载后校验用
+#   6 下载地址    留空 = 还没上传/还没配。支持两种写法:
+#                   gdrive:<FILE_ID>          Google Drive 分享文件的 ID（走 gdown）
+#                   https://...               任何可直连的 URL（走 curl）
+#
+# setup.sh 的流程: 探测路径已就位 -> 跳过；否则去 <仓库根>/archive/ 找包，校验 md5 后
+# 解压；archive/ 里也没有 -> 提醒并打印下载命令（不自动联网拉，近 1 G 由人决定）。
+# 包目录可用 $OCEAN_ARCHIVE 改（默认 <仓库根>/archive）。archive/ 在 .gitignore 里，
+# 只有 archive/restore.sh 和 archive/*.manifest 开了例外，进版本库。
+#
+# 两个还原入口，行为不同，按需要选:
+#   ./setup.sh              连环境/依赖一起装；包缺了算缺件，退出码非 0（其余各步照查）
+#   ./archive/restore.sh    只管包，**两段式全有才动手**: 先把该有的全扫一遍
+#                           （包 + md5 + 那些不在任何包里、缺了跑不起来的输入），
+#                           任何一项缺失就列全问题并 exit 1，一个字节都不解。
+#                           ./archive/restore.sh --check 只体检; web 只解 data 包
+#
+#文件名	解压到	探测路径	大小	md5	下载地址
+legacy_hpm_vis_20260820.tar	.	legacy/hpm/vis	486M	ca00f50a9a62f02a2c5fa8b91b2b0e7e	
+legacy_hpm_outputs_20260820.tar	.	legacy/hpm/outputs	428M	eb5cd1b57eb5e91c47ff0e9c20f6cacf	
+# results_*.tar 里**没有** results/web/priors/（11.4 G）—— 那是派生缓存，删掉就用
+# data/fwv/TK94/output/ 重算，约 5-6 min：
+#   cd code && STAGE=prior CHUNK=10 CASES=TK94 FORCE=1 \
+#     PRIORROOT=../results/web/priors sbatch --partition=eecs --gres=none \
+#     --cpus-per-task=4 --mem=32G --time=04:00:00 vis_adp.sh
+# 也没有 results/web/model/（demo 默认权重，在版本库里）。web-demo 的历史记录默认为空，
+# 由使用者自己点一次；这个包里的 web/vis + submissions.json 只是留档。
+results_20260822.tar	.	results/train	194M	ea153eaa3bcc8224e873d0a754de4ca4	
+# data/ 整个一个包（48.6 G，12122 个文件）: 3d 34.5 G + fwv 8.5 G + 2d 5.6 G。
+# 唯一排除 data/fwv/TK94/build（.o/.mod 编译中间产物，Makefile 在包里，要用重编）。
+# 包里有六个文件版本库里也有一份 —— data/3d/crop_fields.{py,sh} 和
+# data/fwv/{make_cases.py,wk_check.py,TK94/input.txt,TK94/gauges.txt}。restore.sh 用
+# tar --skip-old-files，已存在的一律不覆盖，不会把版本库的版本盖成打包那天的。
+# ⚠️ 探测路径写的是 data/3d/cropped_0.05，不是 data/3d —— 后者会被版本库里的
+# crop_fields.{py,sh} 撑成「非空目录」，于是数据明明没解也判成已就位（踩过）。
+# 但探测终究只看一个路径，只有 3d 没有 2d/fwv 时仍会误判，暂时靠自觉。
+# 另: web-demo 真正读到的只有其中约 3.1 G（FUNWAVE 的 dep.out + eta/u/v/mask 的
+# #999-1999，加 data/3d/cropped_0.05 的 coords/lbo/slice/times/stats）。
+data_20260822.tar	.	data/3d/cropped_0.05	48.6G	e247b1468ec4f706245ada02fb76f126	
+# legacy/ 里**除 hpm 之外**的部分（12.7 G，219 个文件）: fno 12.6 G（processed_data
+# 6.4 G + outputs 6.2 G）+ transolver++ 355 M + tsolverpp 132 M + pod-lstm + env_info。
+# ⚠️ 名字叫 legacy_* 但不含 legacy/hpm —— 那条线是当前主力 code/ 的前身，随手要翻，
+# 留在版本库里不打包。hpm/{vis,outputs,wandb} 是早先另行摘走的，前两者有自己的
+# legacy_hpm_*.tar。排除 __pycache__ 和 .gitkeep（目录骨架，不是内容）。
+# 包里含 git 跟踪的历史线源码，restore.sh 用 --skip-old-files，不会覆盖版本库的版本。
+# 探测路径挑 legacy/fno/processed_data：它被 .gitignore 的 processed_data/ 挡着，
+# 永远不会被版本库里的文件撑成「非空」（data/3d 那个坑的教训）。
+legacy_20260822.tar	.	legacy/fno/processed_data	12.7G	7014cb9fe0603280842c4b26b5164f5f	

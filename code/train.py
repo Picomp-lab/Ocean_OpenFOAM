@@ -47,6 +47,7 @@ per-sample 的断链/保链。
 """
 
 import contextlib
+import os
 import time
 from pathlib import Path
 
@@ -63,10 +64,54 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+
+def wandb_ready(cfg) -> bool:
+    """wandb.enabled=true 只是「想用」, 这里判断「能不能用」。
+
+    没装 / 没登录时 wandb.init 会停在交互式提示上等输入 —— 在 SLURM 里就是一个
+    白占着 GPU 熬到 --time 超时的作业, 日志里什么都看不出来。所以开跑前先判掉,
+    判不过就只在 log 里写清楚原因, 训练照常跑, 后面所有 wandb 调用全部跳过。
+
+    WANDB_MODE=offline 不需要 key (落本地 wandb/ 目录, 事后 wandb sync 补传)。
+    """
+    if not cfg.wandb.enabled:
+        return False
+
+    if not HAS_WANDB:
+        print("[wandb] 环境里没装 wandb —— 本次不记录, 训练照常。")
+        print("[wandb] 要用: pip install wandb  (或在仓库根目录跑 ./setup.sh)")
+        return False
+
+    mode = os.environ.get("WANDB_MODE", "").strip().lower()
+    if mode in ("offline", "dryrun"):
+        print(f"[wandb] WANDB_MODE={mode} —— 只落本地, 事后 wandb sync 补传。")
+        return True
+    if mode == "disabled":
+        print("[wandb] WANDB_MODE=disabled —— 本次不记录, 训练照常。")
+        return False
+
+    key = os.environ.get("WANDB_API_KEY")
+    if not key:
+        try:
+            key = wandb.api.api_key          # 读 ~/.netrc / wandb settings
+        except Exception:
+            key = None
+    if not key:
+        print("[wandb] 没找到 API key (环境变量 WANDB_API_KEY 和 ~/.netrc 里都没有)"
+              " —— 本次不记录, 训练照常。")
+        print("[wandb] 要记录的话三选一, 然后重投:")
+        print("[wandb]   wandb login                 # 在登录节点做, 计算节点不一定通外网")
+        print("[wandb]   export WANDB_MODE=offline   # 先离线记, 事后 wandb sync")
+        print("[wandb]   sbatch run.sh wandb.enabled=false")
+        return False
+
+    return True
+
+
 from dataset import (PriorSeqDataset, WindowSeqDataset, assemble, branch_norms,
                      expand_range, input_dim, load_coords, reconstruct,
                      resolve_stats)
-from hpm_model import HPM, strip_legacy_basis
+from hpm_model import HPM
 from schema import ChannelSchema, advance_window, auto_run_name
 
 
@@ -492,26 +537,30 @@ def main(cfg: DictConfig):
     dnames = [schema.names[i] for i in schema.delta_indices]
 
     # ---- resume ----
-    # strip_legacy_basis 无条件调用: 新 ckpt 里没有那些键 (no-op), 旧 ckpt 里
-    # 有 persistent basis (会让 strict=True 炸)。一处处理, 新旧都能接上。
     start_epoch, best_val = 0, float('inf')
     latest_path = save_dir / "latest.pt"
     if latest_path.exists():
         ck = torch.load(latest_path, map_location=device, weights_only=False)
-        model.load_state_dict(strip_legacy_basis(ck['model']), strict=True)
+        model.load_state_dict(ck['model'], strict=True)
         optimizer.load_state_dict(ck['optimizer'])
         scheduler.load_state_dict(ck['scheduler'])
         start_epoch = ck['epoch'] + 1
         best_val = ck.get('best_val', float('inf'))
         print(f"Resumed from epoch {start_epoch}, best_val={best_val:.6f}")
 
-    if HAS_WANDB and cfg.wandb.enabled:
+    use_wandb = wandb_ready(cfg)
+    if use_wandb:
         from hydra.core.hydra_config import HydraConfig
         od = HydraConfig.get().job.override_dirname
         wname = cfg.wandb.name + (f"_{od}" if od else "")
         print(f"wandb run name: {wname}")
-        wandb.init(project=cfg.wandb.project, name=wname,
-                   config=OmegaConf.to_container(cfg, resolve=True))
+        try:
+            wandb.init(project=cfg.wandb.project, name=wname,
+                       config=OmegaConf.to_container(cfg, resolve=True))
+        except Exception as e:
+            # init 还是可能挂 (计算节点不通外网 / 服务端 5xx)。别让它带走整个训练。
+            use_wandb = False
+            print(f"[wandb] init 失败, 本次不记录, 训练照常: {type(e).__name__}: {e}")
 
     print("\n判据: val = R 步纯 rollout nRMSE (部署条件) vs Δ=0 基线\n")
     for epoch in range(start_epoch, cfg.train.epochs):
@@ -548,7 +597,7 @@ def main(cfg: DictConfig):
         if bn:
             print("   ‖W‖ " + "  ".join(f"{k}={v:.3f}" for k, v in bn.items()))
 
-        if HAS_WANDB and cfg.wandb.enabled:
+        if use_wandb:
             log = {"train_loss": tr_loss, "val_rollout_loss": va_loss,
                    "ss_p": p, "lr": lr, "epoch": epoch,
                    "gpu_mem_alloc_gb": mem_alloc,
@@ -573,7 +622,7 @@ def main(cfg: DictConfig):
             print(f"  → New best: {best_val:.6f}")
 
     print(f"\nDone. Best val rollout loss: {best_val:.6f}")
-    if HAS_WANDB and cfg.wandb.enabled:
+    if use_wandb:
         wandb.finish()
 
 

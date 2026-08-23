@@ -10,12 +10,23 @@
 # ══════════════════════════════════════════════════════════════════════════
 #  推理可视化 / VIS — pred | lt 派发 (两条线通用)
 #  用法: 从 code/ 提交 ->  mkdir -p logs && sbatch vis.sh
+#  ⚠️ logs/ 必须**提交前**就存在: #SBATCH --output 在脚本执行之前生效，目录不在时
+#     SLURM 会把日志整个丢掉，而作业状态照样是 COMPLETED（实测），出事没法查。
 #
 #  ── 子命令 (SUB, 默认 pred) ──────────────────────────────────────────────
 #     SUB=pred  GT|pred 逐帧对比 (fwv 附带 tf/rollout gap 与 [自检] tf nRMSE)
 #               默认: chunk=9  style=both  FIELDS= pure 全 enabled / fwv 四场
 #     SUB=lt    长期 rollout, 无 GT, 流式 (仅 fwv 线)
 #               默认: chunk=10 style=tri   FIELDS= alpha
+#
+#  ── 误差行 (DIFF, 仅 pred; 默认空 = 不渲, 与老行为一致) ────────────────────
+#     DIFF=abs   Δ = pred − GT, 物理单位, 色标自适应 ±p99|Δ| -> 看误差长在哪
+#     DIFF=pct   Δ% = Δ/S x 100, 色标固定 ±100%       -> 跨 run/ckpt 并排比
+#     DIFF=both  两行都要 (共 4 行)
+#     配套: PCT_SCALE=range|rms|p99 (Δ% 的分母 S, 默认 range=GT 满量程)
+#           DIFF_PCT=99             (仅 abs 行的色标分位数)
+#           ROW_H=                  (每行英寸高; 留空 = DIFF=both 时自动 10.0,
+#                                    见下方 —— 默认 10.8 x 4 行会越过 4096 px)
 #     其余接口留在 vis.py, 手敲 (无需定位逻辑):
 #       python vis.py gt    --data_dir <d> --chunks 0-10          # 纯数据探查
 #       python vis.py align --fw-dir <fw>/output --chunk 9        # 配准 (训练前)
@@ -30,7 +41,7 @@
 #     vis.py            本入口 (SUB=pred|lt)
 #       └ import schema.py        ChannelSchema (通道派生)
 #       └ import dataset.py       assemble/reconstruct/resolve_stats (与训练共用)
-#       └ import hpm_model.py     HPM + strip_legacy_basis
+#       └ import hpm_model.py     HPM
 #
 #  ── 输入 / 输出 (io) ─────────────────────────────────────────────────────
 #     in : $CONFIG (.hydra/config.yaml)  $CKPT (best.pt)  DATA/PRIOR (从 config 读)
@@ -49,11 +60,13 @@ if [ "$(basename "${SLURM_SUBMIT_DIR:-}")" != "code" ] || [ ! -f "vis.py" ]; the
     echo "       当前提交目录: ${SLURM_SUBMIT_DIR:-<非 SLURM 环境>}   cwd: $PWD"
     exit 1
 fi
-REPO="$(dirname "$PWD")"                   # code/ 的父级 = models (results/ data/ 同级)
-mkdir -p logs
+mkdir -p logs                              # 兜底; 但 #SBATCH --output 在脚本跑之前就要用它,
+                                           # 所以提交前 logs/ 就得在 (见顶部 banner)
+# $REPO 由下面的 activate.sh 导出 (= 仓库根, results/ data/ 与 code/ 同级)
 
-source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh
-conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
+_d="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
+source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
 
 # ---- 定位 checkpoint / config (显式 CONFIG/CKPT 优先, 否则 RUN[/TS]) ----
 # RUN = runname (必给, 不含 /); TS = 时间戳 (可选, 省则取该 RUN 下最新且含 best.pt 的)。
@@ -73,25 +86,53 @@ if [ -z "${CONFIG:-}" ] || [ -z "${CKPT:-}" ]; then
     RUN_DIR="$TRAIN_ROOT/$RUN"
     [ -d "$RUN_DIR" ] || { echo "ERROR: 找不到 $RUN_DIR (RUN 拼写错误?)"; exit 1; }
 
-    if [ -z "$TS" ]; then
-        # glob 按字典序返回, 循环留最后一个含 best.pt 的子目录 = 时间戳最新
-        for d in "$RUN_DIR"/*/; do
-            [ -f "${d}checkpoints/best.pt" ] || continue
-            TS="$(basename "$d")"
-        done
-        [ -n "$TS" ] || { echo "ERROR: $RUN_DIR 下没有含 checkpoints/best.pt 的时间戳目录"; exit 1; }
-        echo "[vis.sh] RUN='$RUN' -> 最新时间戳 TS=$TS"
-    else
-        echo "[vis.sh] RUN='$RUN'  TS='$TS' (精确)"
+    # 目录布局是 <总方向 runname>/[<细节修改 override_dirname>/]<时间戳>/checkpoints/best.pt
+    # —— 带 CLI 覆盖的 run 会被 hydra 多插一层 override_dirname，没覆盖时就只有两层。
+    # 两种都要认，所以按 best.pt 去找，而不是假定深度。"最新" 仍按时间戳目录名字典序
+    # (它们是 %Y-%m-%d_%H-%M-%S，字典序==时间序)。
+    RESOLVED=""; TS_BEST=""; NCAND=0
+    while IFS= read -r ck; do
+        [ -n "$ck" ] || continue
+        rel="${ck#"$TRAIN_ROOT/"}"; rel="${rel%/checkpoints/best.pt}"
+        ts="${rel##*/}"
+        if [ -n "$TS" ] && [ "$ts" != "$TS" ]; then continue; fi
+        NCAND=$((NCAND + 1))
+        if [ -z "$TS_BEST" ] || [[ "$ts" > "$TS_BEST" ]]; then TS_BEST="$ts"; RESOLVED="$rel"; fi
+    done < <(find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path '*/checkpoints/best.pt' 2>/dev/null | sort)
+
+    if [ -z "$RESOLVED" ]; then
+        if [ -n "$TS" ]; then echo "ERROR: $RUN_DIR 下没有 TS=$TS 且含 checkpoints/best.pt 的目录"
+        else echo "ERROR: $RUN_DIR 下没有含 checkpoints/best.pt 的目录"; fi
+        echo "       现有的是:"
+        find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path '*/checkpoints/best.pt' 2>/dev/null \
+            | sed "s|$TRAIN_ROOT/||; s|/checkpoints/best.pt||; s/^/         /" | head -10
+        exit 1
+    fi
+    if [ -n "$TS" ] && [ "$NCAND" -gt 1 ]; then
+        echo "ERROR: TS=$TS 在 $RUN 下命中 $NCAND 个 (不同的细节修改层)，请直接给 CONFIG/CKPT:"
+        find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path "*/$TS/checkpoints/best.pt" 2>/dev/null \
+            | sed 's/^/         /'
+        exit 1
+    fi
+    TS="$TS_BEST"
+    echo "[vis.sh] RUN='$RUN' -> $RESOLVED"
+    if [ "$NCAND" -gt 1 ]; then
+        echo "[vis.sh] （该 RUN 下有 $NCAND 个候选，取时间戳最新的这个）"
     fi
 
-    RESOLVED="$RUN/$TS"
     CONFIG="$TRAIN_ROOT/$RESOLVED/.hydra/config.yaml"
     CKPT="$TRAIN_ROOT/$RESOLVED/checkpoints/best.pt"
-    FEATURE="${FEATURE:-$RESOLVED}"                    # 保留 runname/时间戳 层级
+    FEATURE="${FEATURE:-$RESOLVED}"        # 输出目录镜像 results/train 下的同一条路径
 else
     echo "[vis.sh] 使用显式 CONFIG/CKPT"
-    FEATURE="${FEATURE:-explicit_$(date +%m%d_%H%M)}"
+    # ckpt 若就在 results/train 下, 直接镜像它那条路径, 别丢溯源;
+    # 指到别处 (临时快照之类) 才回落到 explicit_<时间>。
+    case "$CKPT" in
+        "$TRAIN_ROOT"/*/checkpoints/*)
+            _rel="${CKPT#"$TRAIN_ROOT/"}"; _rel="${_rel%/checkpoints/*}"
+            FEATURE="${FEATURE:-$_rel}" ;;
+        *)  FEATURE="${FEATURE:-explicit_$(date +%m%d_%H%M)}" ;;
+    esac
 fi
 
 [ -f "$CONFIG" ] || { echo "ERROR: config 不存在: $CONFIG"; exit 1; }
@@ -149,6 +190,29 @@ NFRAMES="${NFRAMES:-0}"                    # 0=跑到末尾; pred 验证设 8 �
 if [ "$SUB" = lt ] && [ "$STYLE" = both ]; then
     echo "ERROR: lt 不支持 STYLE=both; 用 tri 或 scatter"; exit 1; fi
 
+# ---- 误差行 (仅 pred; vis.py 只给 pred 挂了 --diff) ----
+# ROW_H 留空时按行数自适应: dpi 固定 100, 像素高 = row_h x 行数 x 100。DIFF=both
+# 是 4 行, 默认 10.8 -> 4320 px, 越过不少播放器硬解的 4096 上限 (vis.py render()
+# 只警告不改默认) -> 这里降到 10.0 = 4000 px。abs/pct 单行版共 3 行, 10.8 才 3240,
+# 不动。显式给 ROW_H 一律照办。
+DIFF="${DIFF:-}"
+ROW_H="${ROW_H:-}"
+DIFF_ARGS=()
+if [ -n "$DIFF" ]; then
+    case "$DIFF" in abs|pct|both) ;; *)
+        echo "ERROR: DIFF 只支持 abs|pct|both (留空=不渲误差行)。当前 DIFF='$DIFF'"
+        exit 1 ;;
+    esac
+    if [ "$SUB" != pred ]; then
+        echo "ERROR: DIFF 仅 SUB=pred 支持 (lt 无 GT, 无从算 Δ)"; exit 1; fi
+    DIFF_ARGS=(--diff "$DIFF"
+               --pct-scale "${PCT_SCALE:-range}"
+               --diff-pct  "${DIFF_PCT:-99}")
+    if [ -z "$ROW_H" ] && [ "$DIFF" = both ]; then ROW_H=10.0; fi
+fi
+# 独立的 if, 不写 `[ ... ] && ...` —— 那在 set -e 下条件为假就是整脚本退出。
+if [ -n "$ROW_H" ]; then DIFF_ARGS+=(--row-h "$ROW_H"); fi
+
 OUT_ROOT="$REPO/results/vis/$SUB/$FEATURE"
 
 NF_SHOW=$([ "$NFRAMES" -le 0 ] 2>/dev/null && echo "0(=full-chunk)" || echo "$NFRAMES")
@@ -160,6 +224,7 @@ echo "  DATA   : $DATA"
 echo "  PRIOR  : ${PRIOR:-<from config>}"
 echo "  line=$LINE (window=$WINDOW)  chunk=$CHUNK  n_frames=$NF_SHOW  style=$STYLE"
 echo "  fields : $FIELDS"
+if [ ${#DIFF_ARGS[@]} -gt 0 ]; then echo "  diff   : ${DIFF_ARGS[*]}"; fi
 echo "  out    : $OUT_ROOT/"
 echo "  node   : $(hostname)   date: $(date)"
 echo "========================================"
@@ -186,7 +251,8 @@ for FIELD in $FIELDS; do
             --n_frames    "$NFRAMES" \
             --style       "$STYLE" \
             --field       "$FIELD" \
-            --output      "$OUT_ROOT/compare_chunk${CHUNK}_${FIELD}.mp4"
+            --output      "$OUT_ROOT/compare_chunk${CHUNK}_${FIELD}.mp4" \
+            ${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}
     else   # lt: 长期 rollout, 无 GT, 流式 (prior_dir 由 vis.py 从 config 读)
         python -u vis.py lt \
             --config_path "$CONFIG" \
@@ -196,7 +262,8 @@ for FIELD in $FIELDS; do
             --n_frames    "$NFRAMES" \
             --style       "$STYLE" \
             --field       "$FIELD" \
-            --output      "$OUT_ROOT/longterm_chunk${CHUNK}_${FIELD}.mp4"
+            --output      "$OUT_ROOT/longterm_chunk${CHUNK}_${FIELD}.mp4" \
+            ${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}
     fi
 done
 

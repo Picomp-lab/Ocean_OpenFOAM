@@ -7,14 +7,27 @@ vis.py — 唯一可视化入口 (single visualization entry point)。
 vis_fw_lt 七个脚本。它们的渲染层几乎逐字相同 (slice 缓存、OpacityReds 配色、
 draw、ffmpeg 导出), 拆开写就是七份拷贝, 改一处要同步七遍。
 
-五个子命令 —— 按流水线位置排列
+六个子命令 —— 按流水线位置排列
 ------------------------------
     gt      纯数据探查。1 行 GT alpha, 可一次跑多个 chunk。不加载模型。
     align   配准检查。2 行: prior | GT。**生成 prior 之前**跑, 不要 checkpoint。
             prior 由 FUNWAVE 现算, 只算 y=0.30 切片上那几万个 cell (非全域
-            574163), 比 gen_prior 便宜两个量级。用来目视确认 t-offset k。
+            574163) -> 不必先生成 prior 产物。用来目视确认 t-offset k。
+    lift    只渲 prior 本身。1 行, 同样是 FUNWAVE **现算**, 无模型、无 GT、
+            不读 prior 产物 —— 跳过 gen_prior 直接看抬升表现。
+            align 要成对 GT 帧, 而 chunk 10 只有 1 帧 GT (times 却有 1000 个),
+            那条路走不通, 故单列。给 --config_path 则切到 schema 通道空间
+            (选列 + αU 加权), 与 lt 的视频逐像素可比 -> 分辨
+            "模型退化" 与 "prior 本身就没信息"。
     pred    主力对比。2 行: GT | pred。**两条线通用**。
             速度看分量也走这里: --field Ux / Uz (或 Umag 看模长), 一次一个分量。
+            --diff 再加误差行 (看误差长在哪, 而不只是 RMSE 一个数):
+              abs  Δ = pred − GT, 物理单位。色标自适应 (±p99|Δ|) -> 无论误差
+                   大小都撑满, 负责**看结构**。
+              pct  Δ% = Δ / (GT 满量程) x 100。色标**固定 ±100%** -> 误差小就
+                   淡、大就饱和, 负责**跨 run / 跨 checkpoint 并排比**。
+                   两行的差别全在色标: 自适应会把分母约掉, 固定不会 (见 pct_scale)。
+              both 两行都要 (4 行, 4320 px 高, render 会提示 --row-h)
     nofb    无反馈臂专用。3 行: prior | pred | GT, 逐帧独立无 rollout。
     lt      长期 rollout, 无 GT。1 行, 边推边写视频帧 (防 OOM)。
 
@@ -23,8 +36,10 @@ draw、ffmpeg 导出), 拆开写就是七份拷贝, 改一处要同步七遍。
     window == 0   HPM+FUNWAVE   base=prior, 输入 [prior | x_f*m]
 
 流水线位置
-    scan_toffset -> vis.py align -> gen_prior -> train -> vis.py {pred,nofb,lt}
-        测出 k      目视确认 k     按 k 生成    训练       看模型效果
+    scan_toffset -> vis.py {align,lift} -> gen_prior -> train -> vis.py {pred,nofb,lt}
+        测出 k       目视确认 k / 看抬升    按 k 生成    训练       看模型效果
+    align 与 lift 都在 gen_prior **之前**就能跑 (现算), 故 prior 产物出问题时
+    可以拿它们做故障隔离: 现算好而产物坏 -> 问题在 gen_prior, 不在 lift。
 
 装配一致性: assemble / reconstruct / advance_window 一律 import dataset 与
 schema —— 与训练逐字节一致, 不重写, 不漂。全程 normalized 空间递归, 只在算
@@ -34,9 +49,12 @@ schema —— 与训练逐字节一致, 不重写, 不漂。全程 normalized �
 ----
   python vis.py gt    --data_dir <d> --chunks 0-10
   python vis.py align --fw-dir <fw>/output --chunk 9
+  python vis.py lift  --fw-dir <fw>/output --chunk 10          # raw 抬升通道
+  python vis.py lift  --fw-dir <fw>/output --chunk 10 \\
+                      --config_path <run>/.hydra/config.yaml   # 与 lt 可比
   python vis.py pred  --config_path <run>/.hydra/config.yaml \\
                       --checkpoint <run>/checkpoints/best.pt \\
-                      --data_dir <d> --chunk_id 8 --field alpha
+                      --data_dir <d> --chunk_id 8 --field alpha --diff
   python vis.py lt    --config_path ... --checkpoint ... --data_dir ... \\
                       --prior_dir <p> --chunk_id 10
 """
@@ -140,6 +158,75 @@ def make_cmap(field, arrays, pct=99):
     return cmap, np.linspace(vmin, vmax, 128), vmin, vmax
 
 
+def pct_scale(gt_slice, how):
+    """百分比版 Δ% 的分母 S —— 一个常数标量, 整段渲染共用 (所有帧所有点上算一次)。
+
+      range (默认) max(GT) - min(GT), 即场的满量程。读作"误差占满量程的百分之几"。
+            alpha 上 S=1.0 (VOF 的物理上下界), 于是 Δ% = Δ x 100, 而 ±100% 恰好
+            是"该点完全错反"—— 这个口径不依赖任何统计量, 换 chunk 换模型都不漂。
+      rms   sqrt(mean(GT^2)), 与 slice-RMSE 同族
+      p99   p99(|GT|), 抗离群的"有效幅值"
+
+    S 是标量, 所以单看数据 Δ% 与 Δ 就是同一张图 (差一个常数因子)。
+    **两行长得不一样, 全靠 pct 行用固定色标而不是分位数自适应**:
+        abs 行  clim = ±p99(|Δ|)  自适应 -> 误差再小也撑满, 永远看得见结构
+        pct 行  clim = ±100%      绝对锚定 -> 误差小就淡, 大就饱和
+    于是 pct 行能跨 run / 跨 checkpoint / 跨 field 并排比 (这是百分比版的全部
+    意义), abs 行负责看结构。换任何别的标量分母都改变不了这一点 —— S 在
+    "着色位置 = Δ%/m%" 的分子分母里各出现一次会约掉, 旋钮是色标不是分母。
+
+    Returns: (S, 人类可读的口径说明)
+    """
+    g = gt_slice.astype(np.float64)
+    if how == "range":
+        S, desc = float(g.max() - g.min()), "GT max-min"
+    elif how == "rms":
+        S, desc = float(np.sqrt((g ** 2).mean())), "GT rms"
+    elif how == "p99":
+        S, desc = float(np.percentile(np.abs(g), 99)), "p99|GT|"
+    else:
+        raise ValueError(f"unknown --pct-scale {how}")
+    assert S > 1e-12, (
+        f"--pct-scale {how} 得到 S={S:.3g} ≈ 0, 百分比无从定义 "
+        f"(该场在切片上恒为常数?)。换 --pct-scale 或改 --field。")
+    print(f"[pct ] scale S = {S:.6g}  ({desc}, 整段常数, --pct-scale {how})"
+          f"   GT 量程 {g.min():.4g}..{g.max():.4g}")
+    return S, f"{desc} {S:.4g}"
+
+
+def make_diff_cmap(diffs, pct=99, unit="", fixed=None):
+    """误差场 Δ = pred − GT 的**独立**色标。一律 coolwarm 对称 [-m, +m]。
+
+    为什么不跟主色标共用 (这是本函数存在的全部理由):
+      1. Δ 恒有符号。alpha 的白->红 [0,1] 和 Umag 的 magma [0,max] 都会把负误差
+         (预测偏低) 整个压到色标下端画没 —— 而"偏高还是偏低"正是要看的东西。
+      2. Δ 的量级通常比场本身小一个量级。塞进主色标就是一整幅纯白, 什么都看不见。
+    对称同 make_cmap 的硬要求: 中点必须是 0, 否则零误差不落白色, 正负不可比。
+    红 = 预测偏高, 蓝 = 预测偏低, 白 = 准。
+
+    传多个 diff 时**共用**一个 m (取全部的合并分位数) —— 于是 tf 与 rollout、
+    model 与 prior 的误差图逐像素可比, 谁的误差更淡一眼看得出。
+
+    fixed 不为 None 时 m 直接取该值, 不看数据 —— Δ% 行走这条路 (m=100)。
+    这正是让 Δ% 行与 Δ 行**长得不一样**的唯一机制: 自适应色标会把 S 约掉,
+    固定色标不会。代价是误差远小于 m 时整幅偏淡, 但那恰恰是要传达的信息。
+
+    Returns: (cmap, levels, vmin, vmax), 与 make_cmap 同形, 可直接喂 scalar_painter。
+    """
+    av = np.abs(np.concatenate([np.asarray(d).ravel() for d in diffs]))
+    if fixed is not None:
+        m = float(fixed)
+        note = (f"(固定, 不随数据变 -> 跨 run 可比; "
+                f"超出被压成满色的 cell 占 {(av > m).mean() * 100:.2f}%)")
+    else:
+        m = float(av.max() if pct >= 100 else np.percentile(av, pct))
+        note = "(max, 不裁剪)" if pct >= 100 else f"(p{pct:g}, 超出部分压成满色)"
+    m = max(m, 1e-12)                      # 全零误差时兜底, 免得 levels 退化
+    print(f"[clim] Δ=pred−GT: ±{m:.4g}{unit}  {note}   "
+          f"MAE={av.mean():.4g}{unit}  max|Δ|={av.max():.4g}{unit}")
+    return 'coolwarm', np.linspace(-m, m, 128), -m, m
+
+
 def scalar_painter(sl, cmap, levels, vmin, vmax, style, point_size):
     """标量场画笔。返回 painter(ax, vals, label)。"""
     def paint(ax, vals, label):
@@ -172,9 +259,19 @@ def render(out_path, n_frames, labels, frame_fn, title_fn, painter,
         frame_fn: k -> [row0, row1, ...]。**可以有副作用** (lt 在这里推一步
                   rollout), 故保证每帧只调一次
         title_fn: k -> suptitle
-        painter:  scalar_painter 的返回值
+        painter:  scalar_painter 的返回值; 或**每行一个**的列表 —— 误差行
+                  (Δ = pred − GT) 用的是另一套色标, 只能逐行给。
     """
     rows = len(labels)
+    painters = [painter] * rows if callable(painter) else list(painter)
+    assert len(painters) == rows, f"painter 数 {len(painters)} != 行数 {rows}"
+    # dpi 固定 100 (见下方 subplots), 故像素高 = row_h * rows * 100。4 行起就会
+    # 越过 4096 —— libx264 编得出 (会跳到很高的 level), 但不少播放器/浏览器的
+    # 硬解按 4096 设上限, 到时候是"文件没坏却放不了"。不改默认值, 只提醒。
+    px_h = int(row_h * rows * 100)
+    if px_h > 4096:
+        print(f"[warn] 帧高 {px_h} px > 4096, 部分播放器/浏览器硬解会拒。"
+              f"  想稳就 --row-h {4096 / rows / 100:.1f} (或更小)。")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[vid ] {rows} 行 x {n_frames} 帧 -> {out_path}")
@@ -192,8 +289,8 @@ def render(out_path, n_frames, labels, frame_fn, title_fn, painter,
     sup = fig.suptitle("", fontsize=26, color='black', y=1 - 0.45 / fig_h)
 
     def upd(k):
-        for ax, v, lab in zip(axes, frame_fn(k), labels):
-            painter(ax, v, lab)
+        for ax, v, lab, pnt in zip(axes, frame_fn(k), labels, painters):
+            pnt(ax, v, lab)
         sup.set_text(title_fn(k))
 
     ani = animation.FuncAnimation(fig, upd, frames=n_frames,
@@ -212,14 +309,10 @@ def load_model(config_path, checkpoint, data_dir, device, expect_feedback=None):
     """载入 config + schema + 模型。torch 相关 import 延后到这里 —— gt / align
     两个子命令不需要模型栈。
 
-    strip_legacy_basis 无条件调用: 新 ckpt 没有那些键 (no-op), 旧 ckpt 有
-    persistent 的 spectral_basis (会让 strict=True 报缺键)。一处处理, 新旧通吃。
-    (合并前 vis.py / vis_u.py 缺这一步, 换到共享 basis 的模型后会直接报缺键。)
-
     Returns: (cfg, schema, model, line)   line ∈ {'pure', 'fwv'}
     """
     import torch
-    from hpm_model import HPM, strip_legacy_basis
+    from hpm_model import HPM
     from schema import ChannelSchema
     from dataset import assert_prior_compatible, input_dim
 
@@ -255,7 +348,7 @@ def load_model(config_path, checkpoint, data_dir, device, expect_feedback=None):
         max_grad_norm=cfg.train.get('max_grad_norm', 0.0),
     ).to(device)
     ck = torch.load(checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(strip_legacy_basis(ck["model"]), strict=True)
+    model.load_state_dict(ck["model"], strict=True)
     model.eval()
     print(f"[ckpt] epoch {ck.get('epoch', '?')}, "
           f"best_val {ck.get('best_val', float('nan')):.6f}")
@@ -466,7 +559,7 @@ def cmd_gt(a):
 
 
 # ============================================================
-# 子命令 2: align —— 配准检查 (生成 prior 之前跑)
+# 共用: 切片上现算 prior (align 与 lift)
 # ============================================================
 
 def read_scan_k(scan_dir, cid):
@@ -478,6 +571,75 @@ def read_scan_k(scan_dir, cid):
         return json.load(f).get("best_k")
 
 
+def lift_on_slice(a, x_s, z_s, times, k):
+    """在 y=MID_Y 的切片 cell 上**现算** prior。align 与 lift 共用。
+
+    数值路径与 gen_prior 完全一致 (同一个 build_frame), 只是把求值点从全域
+    574163 个 cell 缩到切片这十万个 —— 于是**不必先生成 prior 产物**
+    (chunk 10 那份是 11.5 GB / 5-6 min)。实测切片 107466 cells 对应水平唯一点
+    40018, 而全域是 574163 / 232075, 所以省的是 ~5x, 不是一个量级。
+
+    NaN (干单元 / 域外 / 床下) 按 gen_prior 同一约定填 0。这不是可选项:
+    tricontourf 拒绝非有限值 (ValueError: z array must not contain non-finite
+    values), 留白那条路走不通。改为把逐帧无定义 cell 数返回, 由调用方写进标题
+    —— 数量看得见, 位置看不见。(实测 y=0.30 切片上只有 0.04%, 无效 cell 绝大
+    多数在全域的干区与域外, 中截面几乎不受影响。)
+
+    Args:
+        x_s, z_s: 切片 cell 坐标 (load_slice 的 x / z)
+        times:    CFD 时刻 (s), 决定取哪些 FUNWAVE 帧
+        k:        帧移 (t-offset / plot_intv)
+    Returns:
+        pr   (T, Ns, 5) float32  通道序 lift.CH_NAMES, 已填 0
+        n_fw (T,) int64          每帧对应的 FUNWAVE 帧号
+        bad  (T,) int64          每帧无定义 cell 数 (整帧缺失记为 Ns)
+    """
+    from fw_io import load_static
+    from gen_prior import Bilinear, build_frame
+
+    Ns, T = len(x_s), len(times)
+    h_grid, avail, cache = load_static(a.fw_dir, a.mglob, a.nglob)
+    # 切面固定 y=MID_Y -> 水平去重后只剩不同的 x, 省一个量级的插值
+    xy = np.round(np.stack([x_s + a.x_offset,
+                            np.full(Ns, MID_Y + a.y_offset)], axis=1), 9)
+    uniq, inv = np.unique(xy, axis=0, return_inverse=True)
+    bil = Bilinear(uniq[:, 0], uniq[:, 1], a.mglob, a.nglob, a.dx, a.dy)
+    n_out = int((~bil.inside).sum())
+    print(f"[uniq] 水平唯一点 {len(uniq)} / {Ns} cells "
+          f"({Ns/max(len(uniq),1):.1f} cells per column)"
+          + (f"   [warn] 域外 {n_out}" if n_out else ""))
+
+    n_fw = np.round(times / a.plot_intv).astype(np.int64) + k
+    missing = [int(n) for n in n_fw if n not in avail]
+    if missing:
+        print(f"[warn] {len(missing)} 帧 FUNWAVE 不存在 -> 该帧留空 "
+              f"(示例 {missing[:5]})")
+
+    pr = np.zeros((T, Ns, 5), dtype=np.float32)
+    bad = np.zeros(T, dtype=np.int64)
+    for i, n in enumerate(n_fw):
+        n = int(n)
+        if n not in avail:
+            bad[i] = Ns                    # 整帧缺失 = 全部无定义 (该帧留 0)
+            continue
+        out = build_frame(n, cache, avail, h_grid, bil, z_s, inv,
+                          a.dx, a.dy, a.plot_intv, use_pnh=not a.no_pnh)
+        fin = np.isfinite(out).all(axis=1)
+        out[~fin, :] = 0.0                 # 与 gen_prior 同一约定: 无定义处填 0
+        bad[i] = int((~fin).sum())
+        pr[i] = out.astype(np.float32)
+        if i % 20 == 0:
+            print(f"  prior {i+1}/{T}  fw#{n}", flush=True)
+    nb = int(bad.sum())
+    print(f"[prior] 无定义 cell·帧 {nb} / {T*Ns} "
+          f"({nb/max(T*Ns,1)*100:.2f}%, 已填 0)")
+    return pr, n_fw, bad
+
+
+# ============================================================
+# 子命令 2: align —— 配准检查 (生成 prior 之前跑)
+# ============================================================
+
 def cmd_align(a):
     """prior 与 CFD GT 的两行对比。prior 在切片点上**现算**。
 
@@ -488,8 +650,6 @@ def cmd_align(a):
     各出一支, 看 RMSE 最低 / corr 最高的那个)。
     """
     import lift as LC
-    from fw_io import load_static
-    from gen_prior import Bilinear, build_frame
 
     cid = a.chunk
     data_dir = Path(a.data_dir)
@@ -532,39 +692,7 @@ def cmd_align(a):
     print(f"[gt  ] {gt.shape}  frame {i0}..{i0+T-1}/{T_all}  "
           f"t {times[0]:.2f}..{times[-1]:.2f}")
 
-    h_grid, avail, cache = load_static(a.fw_dir, a.mglob, a.nglob)
-    # 切面固定 y=0.30 -> 水平去重后只剩不同的 x, 省一个量级的插值
-    xy = np.round(np.stack([x_s + a.x_offset,
-                            np.full(Ns, MID_Y + a.y_offset)], axis=1), 9)
-    uniq, inv = np.unique(xy, axis=0, return_inverse=True)
-    bil = Bilinear(uniq[:, 0], uniq[:, 1], a.mglob, a.nglob, a.dx, a.dy)
-    n_out = int((~bil.inside).sum())
-    print(f"[uniq] 水平唯一点 {len(uniq)} / {Ns} cells "
-          f"({Ns/max(len(uniq),1):.1f} cells per column)"
-          + (f"   [warn] 域外 {n_out}" if n_out else ""))
-
-    n_fw = np.round(times / a.plot_intv).astype(np.int64) + k
-    missing = [int(n) for n in n_fw if n not in avail]
-    if missing:
-        print(f"[warn] {len(missing)} 帧 FUNWAVE 不存在 -> 该帧留空 "
-              f"(示例 {missing[:5]})")
-
-    pr = np.zeros((T, Ns, 5), dtype=np.float32)
-    n_bad = 0
-    for i, n in enumerate(n_fw):
-        n = int(n)
-        if n not in avail:
-            continue
-        out = build_frame(n, cache, avail, h_grid, bil, z_s, inv,
-                          a.dx, a.dy, a.plot_intv, use_pnh=not a.no_pnh)
-        fin = np.isfinite(out).all(axis=1)
-        out[~fin, :] = 0.0                 # 与 gen_prior 同一约定: 无定义处填 0
-        n_bad += int((~fin).sum())
-        pr[i] = out.astype(np.float32)
-        if i % 20 == 0:
-            print(f"  prior {i+1}/{T}  fw#{n}", flush=True)
-    print(f"[prior] 无定义 cell·帧 {n_bad} / {T*Ns} "
-          f"({n_bad/max(T*Ns,1)*100:.2f}%, 已填 0)")
+    pr, n_fw, _ = lift_on_slice(a, x_s, z_s, times, k)
 
     if a.field == "Umag":
         iu = [names.index(c) for c in ("Ux", "Uz")]
@@ -606,7 +734,104 @@ def cmd_align(a):
 
 
 # ============================================================
-# 子命令 3: pred —— GT | pred 两行 (两条线通用)
+# 子命令 3: lift —— 只渲 prior 本身, 现算, 无模型/无 GT
+# ============================================================
+
+def cmd_lift(a):
+    """单行 prior, 从 FUNWAVE **现算** —— 不要 GT、不要 checkpoint、不要产物。
+
+    与 align 的区别: 不加载 GT, 故只有一行、不算 RMSE/corr。align 要成对的 GT
+    帧, 而 chunk 10 的 chunk_010_data.npy 只有 1 帧 ((1,N,6), times 却有 1000
+    个), 那条路走不通 —— 而"看 lift 表现"本来就不需要 GT。
+
+    与 lt 的区别: lt 是模型 rollout (要 checkpoint + 全域 prior 产物), 这里只
+    有 prior 本身。给了 --config_path 时两者通道空间/色标/画笔同一套 -> 逐像素
+    可比, 用来分辨"模型退化"与"prior 本身就没信息"。
+
+    通道空间由 --config_path 决定 (它取代旧 prior 子命令靠的就是这一条):
+        不给  raw 抬升通道 (lift.CH_NAMES), 不加权 —— 看抬升算子本身
+        给了  schema 选列 + αU 加权, 与 lt / pred 同一空间 —— 与那些视频可比
+    """
+    import lift as LC
+
+    cid = a.chunk
+    data_dir = Path(a.data_dir)
+    scan_dir = a.scan_dir or os.path.join(a.data_dir, "toffset_scan")
+
+    # k 缺省不硬失败 (align 会): 看 lift 表现不依赖配准, 且 chunk 10 没有 GT
+    # 可标定 —— gen_prior 那边同样是固定 t_offset=0。
+    if a.k is not None:
+        k, k_src = a.k, "--k"
+    else:
+        ks = read_scan_k(scan_dir, cid)
+        k, k_src = (0, "默认 0 (无 scan 结果)") if ks is None \
+            else (ks, f"c{cid:03d}.json")
+    print(f"[k   ] k={k:+d} ({k_src})  ->  t-offset {k*a.plot_intv:+.2f}s")
+
+    sl = load_slice(data_dir)
+    x_s, z_s = sl["x"], sl["z"]
+    Ns = len(x_s)
+
+    # 只读 times, **不读 chunk_XXX_data.npy** —— chunk 10 正是靠这一点才能跑
+    times_all = np.load(data_dir / f"chunk_{cid:03d}_times.npy").astype(np.float64)
+    T_all = len(times_all)
+    if 0 < a.n_frames < T_all:
+        T = a.n_frames
+        i0 = ((T_all - T) // 2 if str(a.start).lower() == "mid" else int(a.start))
+        i0 = max(0, min(i0, T_all - T))
+    else:
+        T, i0 = T_all, 0
+    times = times_all[i0:i0 + T]
+    fidx = np.arange(i0, i0 + T)
+    print(f"[time] frame {i0}..{i0+T-1}/{T_all}  "
+          f"t {times[0]:.2f}..{times[-1]:.2f}")
+
+    pr, n_fw, bad = lift_on_slice(a, x_s, z_s, times, k)
+
+    if a.config_path:
+        from schema import ChannelSchema
+        from dataset import apply_alpha_weighting, prior_indices
+        schema = ChannelSchema.from_cfg(OmegaConf.load(a.config_path))
+        print(schema.describe())
+        pr = apply_alpha_weighting(pr[:, :, prior_indices(schema)], schema)
+        names, disp = list(schema.names), schema.display_names()
+    else:
+        names = disp = list(LC.CH_NAMES)          # raw 抬升通道, 不加权
+
+    if a.field == "Umag":
+        iu = [names.index(c) for c in ("Ux", "Uz") if c in names]
+        if not iu:
+            raise SystemExit(f"[err] 'Umag' 需要速度通道, 现有 {names}")
+        s_pr = np.sqrt(sum(pr[..., i] ** 2 for i in iu))
+        fname = "|U| (xz)"
+    else:
+        if a.field not in names:
+            raise SystemExit(f"[err] --field '{a.field}' 不在 {names} / Umag")
+        fi = names.index(a.field)
+        s_pr, fname = pr[..., fi], disp[fi]
+
+    cmap, levels, vmin, vmax = make_cmap(a.field, [s_pr], a.clim_pct)
+
+    wtag = "" if T == T_all else f"_f{i0}-{i0+T-1}"
+    out_base = Path(a.output) if a.output else \
+        Path(_VIS_OUT) / "lift" / f"c{cid}_{a.field}_k{k:+d}{wtag}.mp4"
+    for st in (["scatter", "tri"] if a.style == "both" else [a.style]):
+        out_path = out_base.with_name(
+            f"{out_base.with_suffix('').name}_{st}{out_base.suffix or '.mp4'}")
+        render(out_path, T,
+               [f"FUNWAVE prior (lifted, no model)  {fname}"],
+               lambda f: [s_pr[f]],
+               lambda f: (f"chunk {cid} | t={times[f]:.2f}s | frame {fidx[f]} | "
+                          f"fw#{n_fw[f]} | {fname} | k={k:+d} | "
+                          f"undefined {bad[f]}/{Ns} ({bad[f]/Ns*100:.2f}%)"),
+               scalar_painter(sl, cmap, levels, vmin, vmax, st, a.point_size),
+               fps=a.fps, fig_w=a.fig_w, row_h=a.row_h)
+    print(f"[done] {fname}  k={k:+d}   无定义均值 "
+          f"{bad.mean():.1f}/{Ns} ({bad.mean()/Ns*100:.2f}%)")
+
+
+# ============================================================
+# 子命令 4: pred —— GT | pred 两行 (两条线通用)
 # ============================================================
 
 def cmd_pred(a):
@@ -655,16 +880,70 @@ def cmd_pred(a):
         print(f"  预测已存: {pp} (float32, ~0.9 GB)")
 
     cmap, levels, vmin, vmax = make_cmap(a.field, [gt_slice, pred_slice], a.clim_pct)
+
+    # 误差行。所有要渲染的臂 (rollout, 以及 --also_tf_video 的 tf) 共用一个 Δ 色标:
+    # tf 的误差本就比 rollout 小一个量级, 各自拉伸色标恰好会把这个差别抹平, 而它
+    # 正是上面 gap(ro-tf) 那个数的可视化形态。Δ% 同理共标尺。
+    want_abs, want_pct = a.diff in ("abs", "both"), a.diff in ("pct", "both")
+    S = None
+    if a.diff:
+        diffs = {tag: ps - gt_slice for tag, ps in rows}
+        if want_abs:
+            dcmap, dlev, dv0, dv1 = make_diff_cmap(list(diffs.values()), a.diff_pct)
+        if want_pct:
+            S, sdesc = pct_scale(gt_slice, a.pct_scale)
+            pcts = {tag: dd / S * 100.0 for tag, dd in diffs.items()}
+            # 固定 ±100%, 不吃 --diff-pct: 自适应色标会把 S 约掉, 两行就同构了。
+            pcmap, plev, pv0, pv1 = make_diff_cmap(list(pcts.values()),
+                                                   unit="%", fixed=100.0)
+        for tag, dd in diffs.items():
+            b, mae, mx = dd.mean(), np.abs(dd).mean(), np.abs(dd).max()
+            line = (f"    Δ {tag:<8} bias={b:+.4f}  MAE={mae:.4f}  max|Δ|={mx:.4f}")
+            if want_pct:
+                line += (f"   |  {b/S*100:+.2f}%  {mae/S*100:.2f}%  {mx/S*100:.2f}%")
+            print(line + "   (bias>0 = 预测整体偏高)")
+
     styles = ["scatter", "tri"] if a.style == "both" else [a.style]
     for st in styles:
+        paint = scalar_painter(sl, cmap, levels, vmin, vmax, st, a.point_size)
+        # 行标题会被画进视频, 只能 ASCII + 希腊/数学符号: 渲染字体是 DejaVu Sans,
+        # 没有 CJK 字形, 写中文出图就是一排豆腐块。
+        dpaint = (scalar_painter(sl, dcmap, dlev, dv0, dv1, st, a.point_size)
+                  if want_abs else None)
+        ppaint = (scalar_painter(sl, pcmap, plev, pv0, pv1, st, a.point_size)
+                  if want_pct else None)
         for tag, ps in rows:
             r = np.sqrt(((gt_slice - ps) ** 2).mean(axis=1))
-            render(f"{out_stem}_{tag}_{st}.mp4", d["n_steps"],
-                   ["Ground Truth", f"HPM {tag}"],
-                   lambda f, _p=ps: [gt_slice[f], _p[f]],
-                   lambda f, _r=r, _t=tag: (f"t={times[f]:.2f}s | {fname} | {_t} | "
-                                            f"Step {f} | slice-RMSE={_r[f]:.4f}"),
-                   scalar_painter(sl, cmap, levels, vmin, vmax, st, a.point_size),
+            labels = ["Ground Truth", f"HPM {tag}"]
+            painter, extra = [paint, paint], []
+            if want_abs:
+                extra.append((diffs[tag], dpaint,
+                              f"Δ = {tag} − GT   (shared clim ±{dv1:.3g};  "
+                              f"red = pred too high,  blue = too low)"))
+            if want_pct:
+                extra.append((pcts[tag], ppaint,
+                              f"Δ% = ({tag} − GT) / {S:.4g} x 100   "
+                              f"(FIXED clim ±100%, comparable across runs;  "
+                              f"scale = {sdesc})"))
+            for arr, pn, lab in extra:
+                labels.append(lab); painter.append(pn)
+            arrs = [e[0] for e in extra]
+
+            def title_fn(f, _r=r, _t=tag, _d=diffs.get(tag) if a.diff else None):
+                s = (f"t={times[f]:.2f}s | {fname} | {_t} | Step {f} | "
+                     f"slice-RMSE={_r[f]:.4f}")
+                if want_pct:
+                    s += f" ({_r[f]/S*100:.2f}%)"
+                if _d is not None:
+                    b, mx = _d[f].mean(), np.abs(_d[f]).max()
+                    s += f" | Δ bias={b:+.4f} max|Δ|={mx:.4f}"
+                    if want_pct:
+                        s += f" | Δ% bias={b/S*100:+.2f}% max={mx/S*100:.2f}%"
+                return s
+
+            render(f"{out_stem}_{tag}_{st}.mp4", d["n_steps"], labels,
+                   lambda f, _p=ps, _a=arrs: [gt_slice[f], _p[f]] + [x[f] for x in _a],
+                   title_fn, painter if a.diff else paint,
                    fps=a.fps, fig_w=a.fig_w, row_h=a.row_h)
 
     # 数值本身无条件算+打印 (成本与原来一致), 只有落盘才看 --save_rmse ——
@@ -680,7 +959,7 @@ def cmd_pred(a):
 
 
 # ============================================================
-# 子命令 4: nofb —— 无反馈臂, prior | pred | GT 三行
+# 子命令 5: nofb —— 无反馈臂, prior | pred | GT 三行
 # ============================================================
 
 def cmd_nofb(a):
@@ -753,8 +1032,9 @@ def cmd_nofb(a):
               f"(第0行 model, 第1行 prior)")
 
 
+
 # ============================================================
-# 子命令 5: lt —— 长期 rollout, 无 GT
+# 子命令 6: lt —— 长期 rollout, 无 GT
 # ============================================================
 
 def cmd_lt(a):
@@ -848,6 +1128,56 @@ def _render_args(p, row_h=10.8, style="tri"):
                         "离群 cell 就会把全图冲淡。")
 
 
+def _diff_args(p):
+    p.add_argument("--diff", nargs="?", const="abs", default=None,
+                   choices=["abs", "pct", "both"],
+                   help="额外渲染误差行。abs (裸 --diff 即此) = Δ = pred − GT, "
+                        "物理单位; pct = Δ/S x 100, 跨场可比的读数; both = 两行都要。"
+                        "一律独立的 coolwarm 对称色标 (红=偏高 蓝=偏低 白=准), 不与"
+                        "主色标共用 —— 主色标吃不下有符号且小一个量级的误差。"
+                        "abs 行自适应 (看结构), pct 行固定 ±100%% (跨 run 可比)。")
+    p.add_argument("--pct-scale", default="range", dest="pct_scale",
+                   choices=["range", "rms", "p99"],
+                   help="Δ%% 的分母 S, 整段常数: range=max(GT)-min(GT) 满量程 "
+                        "(默认; alpha 上 =1.0, 于是 ±100%% 就是'该点完全错反'); "
+                        "rms=sqrt(mean(GT^2)); p99=p99|GT|。")
+    p.add_argument("--diff-pct", type=float, default=99.0, dest="diff_pct",
+                   help="**仅 abs 行**的色标取 |Δ| 的这个分位数 (默认 99, 抗离群)。"
+                        "100 = max, 不裁剪。pct 行固定 ±100%% 不受此参数影响 —— "
+                        "自适应色标会把分母 S 约掉, 那样两行就同构了。"
+                        "与 --clim-pct 分开: 误差分布比场本身重尾得多。")
+
+
+def _fw_args(p):
+    """FUNWAVE 现算那两个子命令 (align / lift) 的共用参数。
+
+    默认值全部对齐 gen_prior.sh —— 现算与产物必须同参数才谈得上互为参照。
+    """
+    p.add_argument("--fw-dir", required=True, dest="fw_dir",
+                   help="FUNWAVE output 目录")
+    p.add_argument("--chunk", type=int, required=True)
+    p.add_argument("--data-dir", default=_DATA, dest="data_dir",
+                   help="CFD 数据目录; 只取切片缓存与 times, 不读场数据")
+    p.add_argument("--scan-dir", default=None, dest="scan_dir",
+                   help="best_k 的 c*.json 目录; 默认 <data-dir>/toffset_scan/")
+    p.add_argument("--k", type=int, default=None,
+                   help="帧移 k, 覆盖 scan 结果。用于目视复核不同 k。"
+                        "align 无 scan 结果时报错, lift 则回落到 0。")
+    p.add_argument("--field", default="alpha")
+    p.add_argument("--x-offset", type=float, default=15.05, dest="x_offset")
+    p.add_argument("--y-offset", type=float, default=0.0, dest="y_offset")
+    p.add_argument("--mglob", type=int, default=1575)
+    p.add_argument("--nglob", type=int, default=30)
+    p.add_argument("--dx", type=float, default=0.02)
+    p.add_argument("--dy", type=float, default=0.02)
+    p.add_argument("--plot-intv", type=float, default=0.05, dest="plot_intv")
+    p.add_argument("--no-pnh", action="store_true", dest="no_pnh")
+    p.add_argument("--n-frames", type=int, default=0, dest="n_frames",
+                   help="取多少帧; 0 = 整个 chunk")
+    p.add_argument("--start", default="mid",
+                   help="起始帧: 整数, 或 'mid' 取 chunk 正中 (默认)")
+
+
 def _model_args(p):
     p.add_argument("--config_path", required=True,
                    help="训练 run 的 .hydra/config.yaml")
@@ -861,8 +1191,8 @@ def _model_args(p):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="HPM 可视化。五个子命令按流水线位置排列: "
-                    "gt / align (训练前) -> pred / nofb / lt (训练后)")
+        description="HPM 可视化。六个子命令按流水线位置排列: "
+                    "gt / align / lift (训练前) -> pred / nofb / lt (训练后)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # ---- gt ----
@@ -875,33 +1205,24 @@ def main():
 
     # ---- align ----
     p = sub.add_parser("align", help="配准检查: prior | GT 两行 (不要 checkpoint)")
-    p.add_argument("--fw-dir", required=True, dest="fw_dir",
-                   help="FUNWAVE output 目录")
-    p.add_argument("--chunk", type=int, required=True)
-    p.add_argument("--data-dir", default=_DATA, dest="data_dir")
-    p.add_argument("--scan-dir", default=None, dest="scan_dir",
-                   help="best_k 的 c*.json 目录; 默认 <data-dir>/toffset_scan/")
-    p.add_argument("--k", type=int, default=None,
-                   help="帧移 k, 覆盖 scan 结果。用于目视复核不同 k。")
-    p.add_argument("--field", default="alpha")
+    _fw_args(p)
     p.add_argument("--gt-channels", type=int, nargs=5, default=[0, 1, 2, 3, 4],
                    dest="gt_channels",
                    help="GT 中 [alpha,Ux,Uy,Uz,p_rgh] 各自的列索引")
-    p.add_argument("--x-offset", type=float, default=15.05, dest="x_offset")
-    p.add_argument("--y-offset", type=float, default=0.0, dest="y_offset")
-    p.add_argument("--mglob", type=int, default=1575)
-    p.add_argument("--nglob", type=int, default=30)
-    p.add_argument("--dx", type=float, default=0.02)
-    p.add_argument("--dy", type=float, default=0.02)
-    p.add_argument("--plot-intv", type=float, default=0.05, dest="plot_intv")
-    p.add_argument("--no-pnh", action="store_true", dest="no_pnh")
-    p.add_argument("--n-frames", type=int, default=0, dest="n_frames",
-                   help="取多少帧; 0 = 整个 chunk")
-    p.add_argument("--start", default="mid",
-                   help="起始帧: 整数, 或 'mid' 取 chunk 正中 (默认)")
     p.add_argument("--output", default=None)
     _render_args(p, row_h=8.0)
     p.set_defaults(fn=cmd_align)
+
+    # ---- lift ----
+    p = sub.add_parser("lift", help="只渲 prior 本身: FUNWAVE 现算, 无模型/无 GT")
+    _fw_args(p)
+    p.add_argument("--config_path", default=None,
+                   help="给了就切到 schema 通道空间 (选列 + αU 加权), 与 lt / "
+                        "pred 的视频逐像素可比; 不给则出 raw 抬升通道。"
+                        "只取 ChannelSchema, 不加载 checkpoint。")
+    p.add_argument("--output", default=None)
+    _render_args(p, row_h=10.8)
+    p.set_defaults(fn=cmd_lift)
 
     # ---- pred ----
     p = sub.add_parser("pred", help="GT | pred 两行 (两条线通用)")
@@ -921,6 +1242,7 @@ def main():
                    help="额外落盘逐帧全场 RMSE _rmse{,_tf}.npy (各 ~1.7 KB)")
     p.add_argument("--output", default=os.path.join(_VIS_OUT, "pred", "compare.mp4"))
     _render_args(p, row_h=10.8)
+    _diff_args(p)
     p.set_defaults(fn=cmd_pred)
 
     # ---- nofb ----

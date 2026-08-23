@@ -1,0 +1,29 @@
+[package]
+name = "wave-demo"
+version = "0.1.0"
+edition = "2021"
+description = "波浪场代理模型的交互式演示 —— 选来浪条件，投到 OSU 集群上算，把结果放回来"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+rust-embed = { version = "8.12.0", features = ["mime-guess"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "time",
+    "sync",
+    "io-util",
+    "fs",
+    "signal",
+] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-rs = "12.0.1"
+
+[profile.release]
+opt-level = 2

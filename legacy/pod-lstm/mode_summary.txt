@@ -1,0 +1,49 @@
+POD Mode Summary
+============================================================
+
+Variable: alpha.water
+  Total modes: 300
+  90.0% energy: 21 modes
+  95.0% energy: 51 modes
+  99.0% energy: 230 modes
+  99.9% energy: 301 modes
+  Top 5 singular values: [1458.7904607  1420.87376992  843.24318562  736.4290121   730.08349522]
+  Top 5 energy fractions: [26.47117415 25.11298688  8.84490263  6.74604377  6.63028867]
+
+Variable: p_rgh
+  Total modes: 300
+  90.0% energy: 5 modes
+  95.0% energy: 11 modes
+  99.0% energy: 49 modes
+  99.9% energy: 293 modes
+  Top 5 singular values: [2543483.52224844 1922305.92902361 1728790.3130257   854921.85855808
+  826503.98847543]
+  Top 5 energy fractions: [40.15626407 22.93720286 18.55154506  4.53678593  4.24019034]
+
+Variable: nut
+  Total modes: 300
+  90.0% energy: 189 modes
+  95.0% energy: 301 modes
+  99.0% energy: 301 modes
+  99.9% energy: 301 modes
+  Top 5 singular values: [0.06154536 0.05647095 0.05532845 0.03673528 0.03614712]
+  Top 5 energy fractions: [16.60974403 13.98371023 13.42360644  5.9175094   5.72953886]
+
+Variable: Ux
+  Total modes: 300
+  90.0% energy: 27 modes
+  95.0% energy: 67 modes
+  99.0% energy: 270 modes
+  99.9% energy: 301 modes
+  Top 5 singular values: [1402.08350358 1382.85248798  787.09717182  690.48638596  689.20407092]
+  Top 5 energy fractions: [26.41446223 25.6948286   8.3243574   6.40625549  6.38248323]
+
+Variable: Uz
+  Total modes: 300
+  90.0% energy: 32 modes
+  95.0% energy: 100 modes
+  99.0% energy: 301 modes
+  99.9% energy: 301 modes
+  Top 5 singular values: [691.80089362 682.99168489 468.23119706 462.44645639 246.85401398]
+  Top 5 energy fractions: [25.48056592 24.83577203 11.67259789 11.38596236  3.24434641]
+

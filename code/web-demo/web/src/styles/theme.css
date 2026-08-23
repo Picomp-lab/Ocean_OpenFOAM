@@ -1,0 +1,192 @@
+/* ============================================================
+   设计 token —— 对着 build.nvidia.com 的模型演示页取的。
+   数值不是估的，是在那个页面上读 getComputedStyle 拿的：
+     页面底 #181818 / 大卡片 #0c0c0c 半径 32px 描边 #333
+     强调色 #76b900，压在上面的文字 #222
+     主按钮 半径 4px 高 40px 14px/700
+     区块标题 20px/500，大标题 24px/500
+
+   **只有暗色**。NVIDIA 那套演示页就是纯暗的，做一版浅色只会两边都不像。
+   ============================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* --- 表面，从下往上四层 --- */
+  --bg: #181818; /* 页面底 */
+  --surface: #0c0c0c; /* 主卡片，比页面还深 —— 内容区是「凹」下去的 */
+  --surface-2: #1e1e1e; /* 卡片里的控件、子面板 */
+  --surface-3: #262626; /* 控件的 hover */
+
+  /* --- 描边。层级靠线，不靠阴影 --- */
+  --line: #333;
+  --line-soft: #262626;
+  --line-strong: #4d4d4d;
+
+  /* --- 文字 --- */
+  --fg: #fff;
+  --fg-2: #b3b3b3;
+  --fg-3: #767676;
+
+  /* --- 强调 --- */
+  --green: #76b900;
+  --green-dim: #5c8f00;
+  --on-green: #222;
+  --blue: #2a7fff; /* 提示条 */
+  --amber: #f5a524; /* 外推警告 */
+  --red: #f5544f;
+
+  /* --- 圆角。卡片很圆(32)，控件很方(4)，这个反差是那套设计的识别点 --- */
+  --r-card: 32px;
+  --r-panel: 8px;
+  --r-ctl: 4px;
+
+  --maxw: 1280px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* NVIDIA Sans 拿不到，退到系统无衬线；字形宽度接近，排版不会走样 */
+  font-family:
+    'NVIDIA Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---------- 排版 ---------- */
+.t-hero {
+  font-size: 1.5rem;
+  line-height: 1.25;
+  font-weight: 500;
+}
+.t-section {
+  font-size: 1.25rem;
+  line-height: 1.3;
+  font-weight: 500;
+}
+.t-body {
+  font-size: 1rem;
+}
+.t-label {
+  font-size: 0.875rem;
+  color: var(--fg-2);
+}
+.t-small {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--fg-3);
+}
+.mono {
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+}
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 通用控件 ----------
+   放在全局而不是各组件里：整个 demo 只有一套控件，抄来抄去反而会跑偏 */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  height: 40px;
+  padding: 0 1rem;
+  border: 1px solid transparent;
+  border-radius: var(--r-ctl);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+}
+.btn-primary {
+  background: var(--green);
+  color: var(--on-green);
+}
+.btn-primary:hover:not(:disabled) {
+  background: #83cc00;
+}
+.btn-primary:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: var(--line-strong);
+  color: var(--fg);
+  font-weight: 400;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.field {
+  display: block;
+  margin-bottom: 1.25rem;
+}
+.field > .lab {
+  display: block;
+  font-size: 0.875rem;
+  color: var(--fg);
+  margin-bottom: 0.5rem;
+}
+
+.select {
+  width: 100%;
+  height: 40px;
+  padding: 0 2rem 0 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-ctl);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  appearance: none;
+  /* 自画箭头：原生的在暗底上是浅色三角，跟这套线性风格不搭 */
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg-2) 50%),
+    linear-gradient(135deg, var(--fg-2) 50%, transparent 50%);
+  background-position:
+    calc(100% - 15px) 17px,
+    calc(100% - 10px) 17px;
+  background-size:
+    5px 5px,
+    5px 5px;
+  background-repeat: no-repeat;
+}
+.select:focus-visible {
+  outline: none;
+  border-color: var(--green);
+}
+
+/* 焦点环统一：键盘用户必须看得见，鼠标用户不该看见 */
+:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,5 @@
+此目录的内容不随仓库分发。
+在 data_20260822.tar 里（2d 数据资产 5.6 G）
+
+还原: 按 archives.tsv 把包下到 archive/，然后 ./archive/restore.sh
+（这个文件只是目录骨架占位，restore.sh 和 setup.sh 的「已就位」判定会跳过它）

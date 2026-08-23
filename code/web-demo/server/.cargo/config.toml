@@ -1,0 +1,3 @@
+# 与 hpc-dash 分开：各自独立的 target 目录，互不触发重编译
+[build]
+target-dir = "target"

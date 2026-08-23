@@ -1,0 +1,55 @@
+# 训练 / 渲染这条链的 python 依赖。setup.sh 读这个文件来装、也读它来检测。
+#   pip install -r requirements.txt
+#
+# 版本是跑出 README 里那些结果的那一套（2026-08 的 ocean 环境）。想升级就改这里，
+# 别去改 setup.sh —— 脚本不认识包名，只认这个文件。
+#
+# 注意 numpy: 版本号与出 README 数字时一致，但那时环境里装的是 conda-forge 构建，
+# 现在这里钉的是 PyPI 构建（2026-08-19 换的，为了不跟 torch 的 libstdc++ 打架）。
+# 同版本号、不同编译产物，BLAS 也不是同一份 —— 复现时值得知道，见 README §6.7-2。
+#
+# ffmpeg 不在这里：它是个二进制不是 python 包，走 conda，setup.sh 建环境时一起装。
+
+# ── torch 系：从 pytorch 的 cu130 源取 ──────────────────────────────────────
+# 集群是 CUDA 13（dgxh 的 H100/H200、ampere 的 A40）。PyPI 上同样叫 2.11.0 的
+# torch 是 cu12 轮子，装上去计算节点 torch.cuda.is_available() 是 False。
+#
+# 这里**故意不写 +cu130**。原因（2026-08-20 用 pip --dry-run 实测过）:
+#   · 写 torch==2.11.0 时，两个源都有候选，但 PEP 440 规定本地版本号排序高于同基
+#     版本，2.11.0+cu130 > 2.11.0，pip 必取 cu130 那个 —— 与旧的 --index-url 写法
+#     结果完全一致，是规范保证不是巧合。
+#   · 写 torch==2.11.0+cu130 反而会坏事：wheel 装完后 dist 元数据里的版本被剥成
+#     2.11.0（+cu130 只留在 torch.__version__ 里），pip 每次都判定"没装"，于是
+#     每跑一次 setup.sh 就重下 2 GB。
+# setup.sh 另有一条检查比对 torch / torchvision 的构建标是否一致，混装了会警告。
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0
+torchvision==0.26.0
+
+# ── 其余走 PyPI ────────────────────────────────────────────────────────────
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.9
+pandas==2.3.3
+pillow==12.2.0
+tqdm==4.67.3
+pyyaml==6.0.3
+
+# hydra + omegaconf: config.yaml 的解析、override_dirname、输出目录都靠它们，
+# 版本敏感，别乱升（1.3.2 是 config.yaml 里那套 resolver 写法的目标版本）。
+omegaconf==2.3.0
+hydra-core==1.3.2
+
+wandb==0.26.1
+
+# transolver++ / tsolverpp / fno 三条线用；code/ 的 HPM 线不碰
+timm==1.0.26
+einops==0.8.2
+
+xxhash==3.7.0
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+
+# share 分区上混着 ivybridge 这类老机器，普通 polars 轮子带 avx512 指令，
+# 一跑就 illegal instruction；lts-cpu 这个变体是编给老指令集的。
+polars-lts-cpu==1.33.1

@@ -34,8 +34,9 @@ FW=/nfs/hpc/share/coast-lab/FUNWAVE/TingKirby1994_3D_spilling_2/output   # ← �
 # --data-dir / --out 用脚本默认 (已验证解析到 ../data/3d/cropped_0.05, 与平铺布局一致)
 
 # ---- 环境 ----
-source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh        # ← 确认: conda 激活路径最易过时
-conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
+_d="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
+source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
 export OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4      # 与 cpus-per-task 一致
 
 # ---- 运行 ----

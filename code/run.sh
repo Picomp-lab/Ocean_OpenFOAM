@@ -13,7 +13,7 @@
 # run.sh — 单 job SLURM 脚本
 #
 # 使用:
-#   cd ~/hpc-share/models/code
+#   cd <repo>/code
 #   mkdir -p logs
 #   sbatch run.sh
 #   sbatch run.sh rollout.R=8
@@ -30,8 +30,9 @@
 
 set -euo pipefail
 
-source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh
-conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
+_d="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
+source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
 
 # ---- `pure` 快捷方式: 纯 HPM 线 ----
 # window=6 -> 基座变成窗口末帧; feedback 必须关

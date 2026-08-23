@@ -32,7 +32,139 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# 云端大文件的本地缓存（默认在仓库外的 ../archive/，这条是防止有人放进仓库里）
+archive/
+*.tar
+
+# 例外：还原器本身要提交。clone 下来 archive/ 是空的，包得从云端硬盘下；脚本要是
+# 不在版本库里，人拿到 8.5 G 的 tar 也不知道该往哪解。git 不进入被忽略的目录，
+# 所以要逐层放行。
+!archive/
+archive/*
+!archive/restore.sh
+!archive/*.manifest
+
 # folders
+# ⚠️ .gitignore **不支持行尾注释** —— 注释只能单独一行，跟在模式后面会变成模式的一部分
+# setup.sh 生成，记环境位置，每人不同
+.env.local
+# 第三方求解器，setup.sh --funwave 按需 clone（见 README §1.4）
+FUNWAVE-TVD/
 server_info
-env_info
+legacy/env_info
+# 产物（train/ vis/ web/）一个都不进版本库 —— 唯一例外见下
+results/*
+
+# 例外：web-demo 的**默认权重**要提交（best.pt 8.6 M + 3 个 .hydra yaml）。
+# 不然 clone 下来 demo 能起但下拉是空的，点不了任何东西 —— 而这份 demo 的意义
+# 就是「打开就能看」。git 不进入被忽略的目录，所以要逐层放行；末尾那条 ! 必须
+# 排在文件开头的 *.pt 之后才能盖住它。
+!results/web/
+results/web/*
+!results/web/model/
+!results/web/model/**
+# 但 .hydra/hydra.yaml 不要 —— 没有任何代码读它，而它里面是 hydra 记录的绝对路径
+# （/nfs/hpc/share/<某人>/...），进版本库就把用户名带进去了。config.yaml 用的是
+# ${repo:} 解析器，没有这个问题。
+results/web/model/**/.hydra/hydra.yaml
+# 306 个 mp4（486 M）。它们从 hpm/vis/ 时代就一直跟着仓库走（commit d8c9d1c），
+# .git 那 482 M 基本全是它们 —— 跟 archives.tsv 头部「视频不进版本库」的说法自相矛盾。
+# 2026-08-22 摘出去了: 实体挪到仓库外的 ../archive/legacy/hpm/vis/，云端副本是
+# archive/legacy_hpm_vis_20260820.tar（334 个文件逐个 md5 核对一致）。
+# ⚠️ 只是不再往前长 —— 历史里的对象还在，clone 体积不变，真瘦身要改写历史。
+legacy/hpm/vis/
 data/*
+
+# 例外：FUNWAVE 基准算例 TK94 的**输入**要进版本库（input.txt + gauges.txt，
+# 是「到底跑了什么」的唯一记录）。输出（8.5 G）、二进制、LOG.txt 继续排除。
+# 通配符写法保留着 —— 以后用 make_cases.py 造新算例，输入会自动被跟踪。
+!data/fwv/
+data/fwv/*
+!data/fwv/*/
+data/fwv/*/*
+!data/fwv/*/input.txt
+!data/fwv/*/gauges.txt
+!data/fwv/make_cases.py
+!data/fwv/wk_check.py
+
+# 同理：3D 数据的生成脚本要进版本库（254 G 数据本身不进，但"怎么造出来的"得留下）
+!data/3d/
+data/3d/*
+!data/3d/crop_fields.py
+!data/3d/crop_fields.sh
+vis_*/
+vis/
+
+# ── web-demo（code/web-demo/）──
+# 原来这些规则分散在 code/web-demo/.gitignore 里，2026-08-23 合并到这一份。
+# 分两处的坏处实测过：node_modules 那两条两边都写了（深层优先，根里那份是死规则），
+# 而 server/bindings/ 那条因为写了**行尾注释**根本没生效 —— 见本文件开头那句警告。
+code/web-demo/server/target/*
+# 例外：编好的后端二进制**要提交**（4.5 M，git 里约 1.6 M）—— clone 下来直接
+# ./start.sh 就能跑（实测：不用编译、不用 conda，前端烤在二进制里）。源码没改时
+# 重编逐字节可复现，不会产生假改动。⚠️ 改了 server/src/ 记得重编再提交。
+# git 不进入被忽略的目录，所以要逐层放行。
+!code/web-demo/server/target/release/
+code/web-demo/server/target/release/*
+!code/web-demo/server/target/release/wave-demo
+# cargo test 跑 ts-rs 时的落点，正式产物在 web/src/types/
+code/web-demo/server/bindings/
+code/web-demo/web/node_modules/
+code/web-demo/web/*.tsbuildinfo
+# 注意：code/web-demo/web/dist/ 是**要提交**的（登录节点编不了前端 ——
+# ulimit -v 15 GB 是硬限制，vue-tsc 的 WASM 起不来），别往这里加规则去排除它。
+
+# web-demo 的运行时状态（results/web/：权重副本、中间场、渲染产物、提交记录、日志、pid）
+# 已经被上面的 results/ 一并排除。整个目录都是跑出来的东西，首次部署要手动建，
+# 见 code/web-demo/README.md。
+
+# ── fwv 线的渲染产物要进版本库 ─────────────────────────────────────────
+# 2026-08-23 决定：`legacy/hpm/fwv/` 下这 40 个 mp4（55 M）进库。它们既不在 git 也不在
+# 任何包里，是全仓库仅有的一处「孤本」；进库之后每样东西都有归属。
+# 同目录的 vis_align/ 那 9 个小视频本来就跟踪着，这算是把判据类产物的口径统一了。
+#
+# ⚠️ 代价说清楚：mp4 不做 delta 压缩，这 55 M 会原样加进 .git，且每个 clone 都要拉。
+# filter-repo 只改历史，动不了这批（它们在新提交里）。
+#
+# 逐层放行：vis/ 是全局通配（见上），要先把这个目录 ! 回来。
+!legacy/hpm/fwv/vis/
+# hpm_fw_ss_R4/ 原本有一条专门的排除规则，已在上面删掉，这里不用再写
+
+# ── 目录骨架 ───────────────────────────────────────────────────────────
+# 内容都在包里（见 archives.tsv），但**目录本身要进版本库** —— clone 下来能一眼
+# 看出东西该放哪，而不是面对一个空仓库猜。git 不跟踪空目录，所以每个占位目录放一个
+# .gitkeep，里面写了这目录的内容在哪个包里、怎么还原。
+#
+# 写法上必须逐层放行: git 不进入被排除的目录，父目录先 ! 回来，再排除其内容，
+# 最后单独放行 .gitkeep。这一整块放在文件末尾是故意的 —— 前面有 vis/、outputs/
+# 这类通配规则，git 是**最后匹配的规则说了算**，放前面会被它们盖掉。
+#
+# ⚠️ archive/restore.sh 和 setup.sh 的「已就位」判定都会跳过 .gitkeep。不跳的话
+# 骨架本身就让每个包都判成已就位，数据没解也不会有人提醒（这个坑踩过一次）。
+!data/2d/
+data/2d/*
+!data/2d/.gitkeep
+!data/3d/cropped_0.05/
+data/3d/cropped_0.05/*
+!data/3d/cropped_0.05/.gitkeep
+!data/fwv/*/output/
+data/fwv/*/output/*
+!data/fwv/*/output/.gitkeep
+!results/train/
+results/train/*
+!results/train/.gitkeep
+!results/vis/
+results/vis/*
+!results/vis/.gitkeep
+!results/web/priors/
+results/web/priors/*
+!results/web/priors/.gitkeep
+!results/web/vis/
+results/web/vis/*
+!results/web/vis/.gitkeep
+!legacy/hpm/vis/
+legacy/hpm/vis/*
+!legacy/hpm/vis/.gitkeep
+!legacy/hpm/outputs/
+legacy/hpm/outputs/*
+!legacy/hpm/outputs/.gitkeep

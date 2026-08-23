@@ -7,8 +7,6 @@ mixer 一份 (H, N, G), 且 persistent=False。输出 bit-identical —— 广�
 被 materialize 的 head 副本, 一个共享 SpectralBasis 模块替代了每 block 一个。
 实测显存 50 GB -> 42.8 GB。
 
-旧版 (parent-era) checkpoint 必须先过 strip_legacy_basis() (文件末尾) 再 load;
-train.py 的 resume 路径已无条件调用它, 新旧 ckpt 都能直接接上。
 
 Based on HPM_Irregular_Mesh.py from the original HPM paper (ICML 2025),
 adapted for field-to-field temporal prediction with:
@@ -363,12 +361,3 @@ class HPM(nn.Module):
         delta = x  # (B, N, out_dim) — raw delta prediction
 
         return delta
-
-def strip_legacy_basis(state_dict, verbose=True):
-    """Drop parent-era persistent basis keys so strict=True load still works."""
-    drop = [k for k in state_dict
-            if k.endswith('spectral_basis') or k.endswith('spectral_pos_emb')]
-    if verbose and drop:
-        freed = sum(state_dict[k].numel() * state_dict[k].element_size() for k in drop)
-        print(f"[strip_legacy_basis] dropped {len(drop)} keys ({freed/1e9:.2f} GB)")
-    return {k: v for k, v in state_dict.items() if k not in drop}

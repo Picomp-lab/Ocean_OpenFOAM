@@ -43,8 +43,9 @@ DATA=../data/3d/cropped_0.05
 XOFF=15.05                          # ← 不标定, 当已知输入 (你确认不动)
 
 # ---- 环境 ----
-source /nfs/stak/a1/rhel5apps/conda/24.3/etc/profile.d/conda.sh
-conda activate /nfs/hpc/share/baoh/.conda/envs/ocean
+_d="${SLURM_SUBMIT_DIR:-$PWD}"
+while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
+source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
 export OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 
 # ---- 运行: 逐 chunk, t_offset 直接从 scan 的 JSON 读 (单一真源, 零转录) ----

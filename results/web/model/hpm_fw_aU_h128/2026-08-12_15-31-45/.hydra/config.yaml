@@ -1,0 +1,72 @@
+data:
+  dir: ${repo:}/data/3d/cropped_0.05
+  prior_dir: ${repo:}/data/3d/cropped_0.05/prior_ktuned
+  train_chunk_range:
+  - 1
+  - 7
+  val_chunk_range:
+  - 8
+  test_chunk_range:
+  - 9
+  window: 0
+  channels:
+  - name: alpha
+    enabled: true
+    update_rule: delta
+    loss_weight: 1.0
+    alpha_weighted: false
+  - name: Ux
+    enabled: true
+    update_rule: delta
+    loss_weight: 1.0
+    alpha_weighted: true
+  - name: Uy
+    enabled: false
+    update_rule: delta
+    loss_weight: 1.0
+    alpha_weighted: false
+  - name: Uz
+    enabled: true
+    update_rule: delta
+    loss_weight: 1.0
+    alpha_weighted: true
+  - name: p_rgh
+    enabled: true
+    update_rule: delta
+    loss_weight: 1.0
+    alpha_weighted: false
+  - name: nut
+    enabled: false
+    update_rule: delta
+    loss_weight: 0.1
+    alpha_weighted: false
+rollout:
+  feedback: self
+  R: 4
+  ss: true
+  p_start: 1.0
+  p_end: 0.1
+  anneal_frac: 0.6
+model:
+  n_hidden: 128
+  n_layers: 6
+  n_heads: 8
+  freq_num: 64
+  dropout: 0.1
+  mlp_ratio: 2
+  spectral_pos_dim: 0
+  use_ckpt: true
+train:
+  batch_size: 1
+  lr: 0.0005
+  weight_decay: 0.0001
+  epochs: 50
+  max_grad_norm: 1.0
+  num_workers: 4
+save:
+  dir: ${hydra:runtime.output_dir}/checkpoints
+wandb:
+  enabled: true
+  project: hpm-wave
+  name: ${runname:}
+  name_suffix: ''
