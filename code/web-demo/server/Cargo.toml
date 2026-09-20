@@ -2,7 +2,7 @@
 name = "wave-demo"
 version = "0.1.0"
 edition = "2021"
-description = "波浪场代理模型的交互式演示 —— 选来浪条件，投到 OSU 集群上算，把结果放回来"
+description = "Interactive demo of the wave-field surrogate model -- pick the incident-wave conditions, submit the job to the OSU cluster, and get the results back"
 
 [dependencies]
 anyhow = "1"

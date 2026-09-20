@@ -7,89 +7,99 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=logs/vis_%j.log
 #
-# ══════════════════════════════════════════════════════════════════════════
-#  推理可视化 / VIS — pred | lt 派发 (两条线通用)
-#  用法: 从 code/ 提交 ->  mkdir -p logs && sbatch vis.sh
-#  ⚠️ logs/ 必须**提交前**就存在: #SBATCH --output 在脚本执行之前生效，目录不在时
-#     SLURM 会把日志整个丢掉，而作业状态照样是 COMPLETED（实测），出事没法查。
+# ==========================================================================
+#  VIS -- inference visualisation, dispatching pred | lt (shared by both lines)
+#  Usage: submit from code/ ->  mkdir -p logs && sbatch vis.sh
+#  WARNING: logs/ must exist **before submitting**: #SBATCH --output takes effect before the
+#     script runs, and when the directory is missing SLURM discards the log entirely while the
+#     job still reports COMPLETED (measured) -- leaving nothing to debug with.
 #
-#  ── 子命令 (SUB, 默认 pred) ──────────────────────────────────────────────
-#     SUB=pred  GT|pred 逐帧对比 (fwv 附带 tf/rollout gap 与 [自检] tf nRMSE)
-#               默认: chunk=9  style=both  FIELDS= pure 全 enabled / fwv 四场
-#     SUB=lt    长期 rollout, 无 GT, 流式 (仅 fwv 线)
-#               默认: chunk=10 style=tri   FIELDS= alpha
+#  -- sub-command (SUB, default pred) --------------------------------------
+#     SUB=pred  frame-by-frame GT|pred comparison (fwv additionally gets the tf/rollout gap
+#               and the [self-check] tf nRMSE)
+#               defaults: chunk=9  style=both  FIELDS= all enabled for pure / four fields for fwv
+#     SUB=lt    long-term rollout, no GT, streaming (fwv line only)
+#               defaults: chunk=10 style=tri   FIELDS= alpha
 #
-#  ── 误差行 (DIFF, 仅 pred; 默认空 = 不渲, 与老行为一致) ────────────────────
-#     DIFF=abs   Δ = pred − GT, 物理单位, 色标自适应 ±p99|Δ| -> 看误差长在哪
-#     DIFF=pct   Δ% = Δ/S x 100, 色标固定 ±100%       -> 跨 run/ckpt 并排比
-#     DIFF=both  两行都要 (共 4 行)
-#     配套: PCT_SCALE=range|rms|p99 (Δ% 的分母 S, 默认 range=GT 满量程)
-#           DIFF_PCT=99             (仅 abs 行的色标分位数)
-#           ROW_H=                  (每行英寸高; 留空 = DIFF=both 时自动 10.0,
-#                                    见下方 —— 默认 10.8 x 4 行会越过 4096 px)
-#     其余接口留在 vis.py, 手敲 (无需定位逻辑):
-#       python vis.py gt    --data_dir <d> --chunks 0-10          # 纯数据探查
-#       python vis.py align --fw-dir <fw>/output --chunk 9        # 配准 (训练前)
-#       python vis.py nofb  --config_path ... --checkpoint ...    # 无反馈臂 3 行
+#  -- error rows (DIFF, pred only; empty by default = not rendered, matching old behaviour) --
+#     DIFF=abs   Delta = pred - GT, physical units, colour scale adapts to +-p99|Delta|
+#                -> shows where the error lives
+#     DIFF=pct   Delta% = Delta/S x 100, colour scale fixed at +-100%
+#                -> for side-by-side comparison across runs/checkpoints
+#     DIFF=both  render both rows (4 rows in total)
+#     Companions: PCT_SCALE=range|rms|p99 (the denominator S of Delta%, default range=GT full scale)
+#                 DIFF_PCT=99             (percentile for the colour scale of the abs row only)
+#                 ROW_H=                  (height of each row in inches; leave empty = 10.0
+#                                          automatically when DIFF=both, see below -- the
+#                                          default 10.8 x 4 rows would exceed 4096 px)
+#     The remaining interfaces stay in vis.py and are typed by hand (no locating logic needed):
+#       python vis.py gt    --data_dir <d> --chunks 0-10          # plain data inspection
+#       python vis.py align --fw-dir <fw>/output --chunk 9        # registration (before training)
+#       python vis.py nofb  --config_path ... --checkpoint ...    # 3 rows for the no-feedback arm
 #
-#  ── 定位方式 (locate ckpt/config) ────────────────────────────────────────
-#     方式 1 (首选): CONFIG=... CKPT=... sbatch vis.sh        显式, 无歧义
-#     方式 2 (兜底): RUN=runname [TS=时间戳] sbatch vis.sh    results/train/ 下解析
-#         RUN 必给且不含 '/'; TS 省则取该 RUN 下时间戳最新的一次 (按目录名字典序)
+#  -- locating ckpt/config -------------------------------------------------
+#     Form 1 (preferred): CONFIG=... CKPT=... sbatch vis.sh     explicit, unambiguous
+#     Form 2 (fallback):  RUN=runname [TS=timestamp] sbatch vis.sh   resolved under results/train/
+#         RUN is required and must not contain '/'; omit TS and the newest timestamp under that
+#         RUN is used (by lexicographic order of the directory name)
 #
-#  ── 依赖代码 (code deps, 均在 code/ 平铺) ─────────────────────────────────
-#     vis.py            本入口 (SUB=pred|lt)
-#       └ import schema.py        ChannelSchema (通道派生)
-#       └ import dataset.py       assemble/reconstruct/resolve_stats (与训练共用)
-#       └ import hpm_model.py     HPM
+#  -- code deps (all flat inside code/) ------------------------------------
+#     vis.py            this entry point (SUB=pred|lt)
+#       -> imports schema.py      ChannelSchema (channel derivation)
+#       -> imports dataset.py     assemble/reconstruct/resolve_stats (shared with training)
+#       -> imports hpm_model.py   HPM
 #
-#  ── 输入 / 输出 (io) ─────────────────────────────────────────────────────
-#     in : $CONFIG (.hydra/config.yaml)  $CKPT (best.pt)  DATA/PRIOR (从 config 读)
+#  -- io -------------------------------------------------------------------
+#     in : $CONFIG (.hydra/config.yaml)  $CKPT (best.pt)  DATA/PRIOR (read from the config)
 #     out: results/vis/$SUB/$FEATURE/  (pred: compare_*_{pred,tf}_{tri,scatter}.mp4;
-#          lt: longterm_*_{tri}.mp4) —— 只有视频
-#          npy 全部默认不存, 要离线分析时给 vis.py 加 --save_rmse (逐帧 RMSE,
-#          各 ~1.7 KB) / --save_preds (全场预测, ~0.9 GB/场); RMSE 数值照常进日志
-# ══════════════════════════════════════════════════════════════════════════
+#          lt: longterm_*_{tri}.mp4) -- videos only.
+#          No npy is written by default; for offline analysis pass vis.py --save_rmse
+#          (per-frame RMSE, about 1.7 KB each) / --save_preds (the full predicted field,
+#          about 0.9 GB per field). The RMSE numbers still go to the log either way.
+# ==========================================================================
 
 set -euo pipefail
 
-# 必须从 code/ 提交: 提交目录名==code 且 cwd 有 vis.py。
-# 用 $SLURM_SUBMIT_DIR (非 $BASH_SOURCE —— sbatch 拷到 spool, 对不上)。:- 防 set -u 崩。
+# Must be submitted from code/: the submit directory must be named code and vis.py must be in cwd.
+# Uses $SLURM_SUBMIT_DIR (not $BASH_SOURCE -- sbatch copies to spool, so it would not match).
+# The :- guards against set -u.
 if [ "$(basename "${SLURM_SUBMIT_DIR:-}")" != "code" ] || [ ! -f "vis.py" ]; then
-    echo "ERROR: 必须从项目 code/ 目录提交:  cd <...>/models/code && sbatch vis.sh"
-    echo "       当前提交目录: ${SLURM_SUBMIT_DIR:-<非 SLURM 环境>}   cwd: $PWD"
+    echo "ERROR: must be submitted from the project's code/ directory:  cd <...>/models/code && sbatch vis.sh"
+    echo "       current submit directory: ${SLURM_SUBMIT_DIR:-<not a SLURM environment>}   cwd: $PWD"
     exit 1
 fi
-mkdir -p logs                              # 兜底; 但 #SBATCH --output 在脚本跑之前就要用它,
-                                           # 所以提交前 logs/ 就得在 (见顶部 banner)
-# $REPO 由下面的 activate.sh 导出 (= 仓库根, results/ data/ 与 code/ 同级)
+mkdir -p logs                              # a fallback; but #SBATCH --output needs it before the
+                                           # script runs at all, so logs/ has to exist before
+                                           # submitting (see the banner at the top)
+# $REPO is exported by activate.sh below (= the repo root; results/ and data/ are siblings of code/)
 
 _d="${SLURM_SUBMIT_DIR:-$PWD}"
 while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
-source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
+source "$_d/activate.sh"          # find conda, activate the environment, and export $REPO
 
-# ---- 定位 checkpoint / config (显式 CONFIG/CKPT 优先, 否则 RUN[/TS]) ----
-# RUN = runname (必给, 不含 /); TS = 时间戳 (可选, 省则取该 RUN 下最新且含 best.pt 的)。
-# "最新" 按目录名字典序 (非 mtime)。
+# ---- locate checkpoint / config (explicit CONFIG/CKPT wins, otherwise RUN[/TS]) ----
+# RUN = runname (required, no /); TS = timestamp (optional; omitted, the newest one under that RUN
+# containing best.pt is used). "Newest" is lexicographic on the directory name, not mtime.
 TRAIN_ROOT="$REPO/results/train"
 RUN="${RUN:-}"
 TS="${TS:-}"
 
 if [ -z "${CONFIG:-}" ] || [ -z "${CKPT:-}" ]; then
     [ -n "$RUN" ] || {
-        echo "ERROR: 未给 CONFIG/CKPT 时, 必须给 RUN=runname (可选 TS=时间戳)"; exit 1; }
+        echo "ERROR: without CONFIG/CKPT you must give RUN=runname (TS=timestamp optional)"; exit 1; }
     case "$RUN" in */*)
-        echo "ERROR: RUN 不能含 '/' (那是 runname, 时间戳请用 TS=...)。当前 RUN='$RUN'"
+        echo "ERROR: RUN must not contain '/' (that is the runname; give the timestamp as TS=...). Current RUN='$RUN'"
         exit 1 ;;
     esac
 
     RUN_DIR="$TRAIN_ROOT/$RUN"
-    [ -d "$RUN_DIR" ] || { echo "ERROR: 找不到 $RUN_DIR (RUN 拼写错误?)"; exit 1; }
+    [ -d "$RUN_DIR" ] || { echo "ERROR: cannot find $RUN_DIR (RUN misspelled?)"; exit 1; }
 
-    # 目录布局是 <总方向 runname>/[<细节修改 override_dirname>/]<时间戳>/checkpoints/best.pt
-    # —— 带 CLI 覆盖的 run 会被 hydra 多插一层 override_dirname，没覆盖时就只有两层。
-    # 两种都要认，所以按 best.pt 去找，而不是假定深度。"最新" 仍按时间戳目录名字典序
-    # (它们是 %Y-%m-%d_%H-%M-%S，字典序==时间序)。
+    # The directory layout is <overall-direction runname>/[<detail-change override_dirname>/]<timestamp>/checkpoints/best.pt
+    # -- a run with CLI overrides gets an extra override_dirname level inserted by hydra, while a
+    # run without them has only two levels. Both have to be recognised, so the search is by
+    # best.pt rather than by assuming a depth. "Newest" is still lexicographic on the timestamp
+    # directory name (they are %Y-%m-%d_%H-%M-%S, where lexicographic == chronological).
     RESOLVED=""; TS_BEST=""; NCAND=0
     while IFS= read -r ck; do
         [ -n "$ck" ] || continue
@@ -101,15 +111,15 @@ if [ -z "${CONFIG:-}" ] || [ -z "${CKPT:-}" ]; then
     done < <(find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path '*/checkpoints/best.pt' 2>/dev/null | sort)
 
     if [ -z "$RESOLVED" ]; then
-        if [ -n "$TS" ]; then echo "ERROR: $RUN_DIR 下没有 TS=$TS 且含 checkpoints/best.pt 的目录"
-        else echo "ERROR: $RUN_DIR 下没有含 checkpoints/best.pt 的目录"; fi
-        echo "       现有的是:"
+        if [ -n "$TS" ]; then echo "ERROR: no directory under $RUN_DIR with TS=$TS and checkpoints/best.pt"
+        else echo "ERROR: no directory under $RUN_DIR contains checkpoints/best.pt"; fi
+        echo "       what does exist:"
         find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path '*/checkpoints/best.pt' 2>/dev/null \
             | sed "s|$TRAIN_ROOT/||; s|/checkpoints/best.pt||; s/^/         /" | head -10
         exit 1
     fi
     if [ -n "$TS" ] && [ "$NCAND" -gt 1 ]; then
-        echo "ERROR: TS=$TS 在 $RUN 下命中 $NCAND 个 (不同的细节修改层)，请直接给 CONFIG/CKPT:"
+        echo "ERROR: TS=$TS matches $NCAND directories under $RUN (different detail-change levels); give CONFIG/CKPT directly:"
         find "$RUN_DIR" -mindepth 2 -maxdepth 4 -path "*/$TS/checkpoints/best.pt" 2>/dev/null \
             | sed 's/^/         /'
         exit 1
@@ -117,16 +127,16 @@ if [ -z "${CONFIG:-}" ] || [ -z "${CKPT:-}" ]; then
     TS="$TS_BEST"
     echo "[vis.sh] RUN='$RUN' -> $RESOLVED"
     if [ "$NCAND" -gt 1 ]; then
-        echo "[vis.sh] （该 RUN 下有 $NCAND 个候选，取时间戳最新的这个）"
+        echo "[vis.sh] (this RUN has $NCAND candidates; taking the one with the newest timestamp)"
     fi
 
     CONFIG="$TRAIN_ROOT/$RESOLVED/.hydra/config.yaml"
     CKPT="$TRAIN_ROOT/$RESOLVED/checkpoints/best.pt"
-    FEATURE="${FEATURE:-$RESOLVED}"        # 输出目录镜像 results/train 下的同一条路径
+    FEATURE="${FEATURE:-$RESOLVED}"        # the output directory mirrors the same path under results/train
 else
-    echo "[vis.sh] 使用显式 CONFIG/CKPT"
-    # ckpt 若就在 results/train 下, 直接镜像它那条路径, 别丢溯源;
-    # 指到别处 (临时快照之类) 才回落到 explicit_<时间>。
+    echo "[vis.sh] using the explicit CONFIG/CKPT"
+    # If the ckpt is itself under results/train, mirror its path so provenance is not lost;
+    # only fall back to explicit_<time> when it points somewhere else (a temporary snapshot, say).
     case "$CKPT" in
         "$TRAIN_ROOT"/*/checkpoints/*)
             _rel="${CKPT#"$TRAIN_ROOT/"}"; _rel="${_rel%/checkpoints/*}"
@@ -135,13 +145,16 @@ else
     esac
 fi
 
-[ -f "$CONFIG" ] || { echo "ERROR: config 不存在: $CONFIG"; exit 1; }
-[ -f "$CKPT" ]   || { echo "ERROR: ckpt 不存在:   $CKPT";   exit 1; }
+[ -f "$CONFIG" ] || { echo "ERROR: config does not exist: $CONFIG"; exit 1; }
+[ -f "$CKPT" ]   || { echo "ERROR: ckpt does not exist:   $CKPT";   exit 1; }
 
-# ---- 从快照 config 读 data_dir / prior_dir / window / enabled 通道 (与训练一致) ----
-# helper 先注册 repo resolver (config 用 ${repo:}), 否则裸 OmegaConf.load 会抛。
-# 输出单行: DATA PRIOR WINDOW ch1 ch2 ...  (prior 空时占位 "-", 保证位置对齐)。
-# 抓输出+判退出码 (进程替换里 set -e 不可靠, 会静默读到空)。
+# ---- read data_dir / prior_dir / window / enabled channels from the snapshot config (same as training) ----
+# The helper registers the repo resolver first (the config uses ${repo:}), otherwise a bare
+# OmegaConf.load would raise.
+# Output is a single line: DATA PRIOR WINDOW ch1 ch2 ...  (when prior is empty a "-" placeholder
+# keeps the positions aligned).
+# Capture the output and check the exit code (set -e is unreliable inside process substitution and
+# would silently read an empty value).
 DP=$(REPO="$REPO" python - "$CONFIG" <<'PYEOF'
 import os, sys
 from omegaconf import OmegaConf
@@ -154,63 +167,66 @@ chs = cfg.data.get("channels", None)
 names = [c["name"] for c in chs if c.get("enabled", True)] if chs else []
 print(cfg.data.dir, prior, window, " ".join(names))
 PYEOF
-) || { echo "ERROR: 读取 config 失败 (见上方 traceback)"; exit 1; }
+) || { echo "ERROR: failed to read the config (see the traceback above)"; exit 1; }
 read -r DATA PRIOR WINDOW ENABLED_CHS <<< "$DP"
 [ "$PRIOR" = "-" ] && PRIOR=""
-[ -n "$DATA" ] || { echo "ERROR: 未能从 config 解析 data.dir"; exit 1; }
+[ -n "$DATA" ] || { echo "ERROR: could not resolve data.dir from the config"; exit 1; }
 
-# ---- SUB: 子命令 pred | lt (gt/align/nofb 见顶部 banner, 手敲) ----
+# ---- SUB: sub-command pred | lt (for gt/align/nofb see the banner at the top; type them by hand) ----
 SUB="${SUB:-pred}"
 case "$SUB" in pred|lt) ;; *)
-    echo "ERROR: SUB 只支持 pred|lt (gt/align/nofb 请手敲 python vis.py ...)"; exit 1 ;;
+    echo "ERROR: SUB supports only pred|lt (for gt/align/nofb type python vis.py ... by hand)"; exit 1 ;;
 esac
 
-# 线别 by window (>0 pure / ==0 fwv)
+# Which line, by window (>0 pure / ==0 fwv)
 if [ "$WINDOW" -gt 0 ]; then LINE=pure; else LINE=fwv; fi
-# lt 仅 fwv 线 (需 prior; vis.py 内部亦 assert)
+# lt is fwv-only (it needs a prior; vis.py asserts this internally as well)
 if [ "$SUB" = lt ] && [ "$LINE" != fwv ]; then
-    echo "ERROR: lt 是 fwv 线专属 (需 prior); 当前 RUN 是 pure (window=$WINDOW)"; exit 1; fi
+    echo "ERROR: lt belongs to the fwv line only (it needs a prior); this RUN is pure (window=$WINDOW)"; exit 1; fi
 
-# ---- 默认参数 (环境变量覆盖), 按 SUB 分流 ----
-#   pred: chunk=9  style=both  FIELDS= pure 全 enabled / fwv 四场
-#   lt  : chunk=10 style=tri   FIELDS= alpha  (长期无 GT, 定性看界面)
+# ---- defaults (overridable by environment variable), split by SUB ----
+#   pred: chunk=9  style=both  FIELDS= all enabled for pure / four fields for fwv
+#   lt  : chunk=10 style=tri   FIELDS= alpha  (no GT over the long term, so the interface is
+#         judged qualitatively)
 if [ "$SUB" = lt ]; then
     CHUNK="${CHUNK:-10}"; STYLE="${STYLE:-tri}"; FIELDS="${FIELDS:-alpha}"
 else
     CHUNK="${CHUNK:-9}";  STYLE="${STYLE:-both}"
     if [ "$LINE" = pure ]; then
-        [ -n "$ENABLED_CHS" ] || { echo "ERROR: pure 线未从 config 解析到 enabled 通道"; exit 1; }
+        [ -n "$ENABLED_CHS" ] || { echo "ERROR: no enabled channels resolved from the config for the pure line"; exit 1; }
         FIELDS="${FIELDS:-$ENABLED_CHS}"
     else
         FIELDS="${FIELDS:-alpha Ux Uz p_rgh}"
     fi
 fi
-NFRAMES="${NFRAMES:-0}"                    # 0=跑到末尾; pred 验证设 8 触发快速自检
-# lt 是流式 rollout, 不能渲两遍 (vis.py assert style!=both)
+NFRAMES="${NFRAMES:-0}"                    # 0=run to the end; set 8 to trigger a quick self-check when validating pred
+# lt is a streaming rollout and cannot be rendered twice (vis.py asserts style!=both)
 if [ "$SUB" = lt ] && [ "$STYLE" = both ]; then
-    echo "ERROR: lt 不支持 STYLE=both; 用 tri 或 scatter"; exit 1; fi
+    echo "ERROR: lt does not support STYLE=both; use tri or scatter"; exit 1; fi
 
-# ---- 误差行 (仅 pred; vis.py 只给 pred 挂了 --diff) ----
-# ROW_H 留空时按行数自适应: dpi 固定 100, 像素高 = row_h x 行数 x 100。DIFF=both
-# 是 4 行, 默认 10.8 -> 4320 px, 越过不少播放器硬解的 4096 上限 (vis.py render()
-# 只警告不改默认) -> 这里降到 10.0 = 4000 px。abs/pct 单行版共 3 行, 10.8 才 3240,
-# 不动。显式给 ROW_H 一律照办。
+# ---- error rows (pred only; vis.py exposes --diff for pred alone) ----
+# When ROW_H is left empty it adapts to the number of rows: dpi is fixed at 100, so pixel height
+# = row_h x rows x 100. DIFF=both means 4 rows, and the default 10.8 -> 4320 px, past the 4096
+# ceiling that quite a few players hardware-decode up to (vis.py render() only warns and does not
+# change the default) -> so it drops to 10.0 = 4000 px here. The single-row abs/pct versions come
+# to 3 rows, where 10.8 is only 3240, so they are left alone. An explicit ROW_H is always obeyed.
 DIFF="${DIFF:-}"
 ROW_H="${ROW_H:-}"
 DIFF_ARGS=()
 if [ -n "$DIFF" ]; then
     case "$DIFF" in abs|pct|both) ;; *)
-        echo "ERROR: DIFF 只支持 abs|pct|both (留空=不渲误差行)。当前 DIFF='$DIFF'"
+        echo "ERROR: DIFF supports only abs|pct|both (empty = do not render error rows). Current DIFF='$DIFF'"
         exit 1 ;;
     esac
     if [ "$SUB" != pred ]; then
-        echo "ERROR: DIFF 仅 SUB=pred 支持 (lt 无 GT, 无从算 Δ)"; exit 1; fi
+        echo "ERROR: DIFF is supported for SUB=pred only (lt has no GT, so there is no Delta to compute)"; exit 1; fi
     DIFF_ARGS=(--diff "$DIFF"
                --pct-scale "${PCT_SCALE:-range}"
                --diff-pct  "${DIFF_PCT:-99}")
     if [ -z "$ROW_H" ] && [ "$DIFF" = both ]; then ROW_H=10.0; fi
 fi
-# 独立的 if, 不写 `[ ... ] && ...` —— 那在 set -e 下条件为假就是整脚本退出。
+# A separate if, not `[ ... ] && ...` -- under set -e the latter exits the whole script when the
+# condition is false.
 if [ -n "$ROW_H" ]; then DIFF_ARGS+=(--row-h "$ROW_H"); fi
 
 OUT_ROOT="$REPO/results/vis/$SUB/$FEATURE"
@@ -229,17 +245,17 @@ echo "  out    : $OUT_ROOT/"
 echo "  node   : $(hostname)   date: $(date)"
 echo "========================================"
 
-# ---- 覆盖保护 (overwrite guard): FORCE=1 强制覆盖 ----
+# ---- overwrite guard: FORCE=1 overwrites ----
 if [ -d "$OUT_ROOT" ] && [ -n "$(ls -A "$OUT_ROOT" 2>/dev/null)" ]; then
     if [ "${FORCE:-0}" != "1" ]; then
-        echo "ERROR: $OUT_ROOT/ 已有内容。FORCE=1 覆盖, 或换 FEATURE=xxx。"
+        echo "ERROR: $OUT_ROOT/ already has content. Use FORCE=1 to overwrite, or pick another FEATURE=xxx."
         exit 1
     fi
-    echo "WARN: FORCE=1, 覆盖 $OUT_ROOT/"
+    echo "WARN: FORCE=1, overwriting $OUT_ROOT/"
 fi
 mkdir -p "$OUT_ROOT"
 
-# ---- 逐场跑 (--field 一次一个; vis.py 自动追加样式/npy 后缀) ----
+# ---- one field at a time (--field takes a single field; vis.py appends the style/npy suffix) ----
 for FIELD in $FIELDS; do
     echo "=== [$SUB] field $FIELD  chunk $CHUNK ==="
     if [ "$SUB" = pred ]; then
@@ -253,7 +269,7 @@ for FIELD in $FIELDS; do
             --field       "$FIELD" \
             --output      "$OUT_ROOT/compare_chunk${CHUNK}_${FIELD}.mp4" \
             ${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}
-    else   # lt: 长期 rollout, 无 GT, 流式 (prior_dir 由 vis.py 从 config 读)
+    else   # lt: long-term rollout, no GT, streaming (prior_dir is read from the config by vis.py)
         python -u vis.py lt \
             --config_path "$CONFIG" \
             --checkpoint  "$CKPT" \

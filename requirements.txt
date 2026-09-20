@@ -1,32 +1,41 @@
-# 训练 / 渲染这条链的 python 依赖。setup.sh 读这个文件来装、也读它来检测。
+# Python dependencies for the training / rendering chain. setup.sh reads this file both
+# to install and to probe.
 #   pip install -r requirements.txt
 #
-# 版本是跑出 README 里那些结果的那一套（2026-08 的 ocean 环境）。想升级就改这里，
-# 别去改 setup.sh —— 脚本不认识包名，只认这个文件。
+# These are the versions that produced the results in README (the ocean environment as of
+# 2026-08). To upgrade, edit this file -- do not touch setup.sh; the script knows no package
+# names, only this file.
 #
-# 注意 numpy: 版本号与出 README 数字时一致，但那时环境里装的是 conda-forge 构建，
-# 现在这里钉的是 PyPI 构建（2026-08-19 换的，为了不跟 torch 的 libstdc++ 打架）。
-# 同版本号、不同编译产物，BLAS 也不是同一份 —— 复现时值得知道，见 README §6.7-2。
+# A note on numpy: the version number matches the one used for the README numbers, but back
+# then the environment held a conda-forge build, whereas what is pinned here is the PyPI
+# build (switched 2026-08-19, to stop it fighting with torch over libstdc++). Same version
+# number, different compiled artifact, and a different BLAS -- worth knowing when
+# reproducing; see README section 6.7-2.
 #
-# ffmpeg 不在这里：它是个二进制不是 python 包，走 conda，setup.sh 建环境时一起装。
+# ffmpeg is not listed here: it is a binary, not a python package, so it comes from conda and
+# setup.sh installs it while creating the environment.
 
-# ── torch 系：从 pytorch 的 cu130 源取 ──────────────────────────────────────
-# 集群是 CUDA 13（dgxh 的 H100/H200、ampere 的 A40）。PyPI 上同样叫 2.11.0 的
-# torch 是 cu12 轮子，装上去计算节点 torch.cuda.is_available() 是 False。
+# -- torch family: taken from pytorch's cu130 index ---------------------------------------
+# The cluster is on CUDA 13 (H100/H200 on dgxh, A40 on ampere). The torch on PyPI that also
+# calls itself 2.11.0 is a cu12 wheel; install that and torch.cuda.is_available() is False on
+# a compute node.
 #
-# 这里**故意不写 +cu130**。原因（2026-08-20 用 pip --dry-run 实测过）:
-#   · 写 torch==2.11.0 时，两个源都有候选，但 PEP 440 规定本地版本号排序高于同基
-#     版本，2.11.0+cu130 > 2.11.0，pip 必取 cu130 那个 —— 与旧的 --index-url 写法
-#     结果完全一致，是规范保证不是巧合。
-#   · 写 torch==2.11.0+cu130 反而会坏事：wheel 装完后 dist 元数据里的版本被剥成
-#     2.11.0（+cu130 只留在 torch.__version__ 里），pip 每次都判定"没装"，于是
-#     每跑一次 setup.sh 就重下 2 GB。
-# setup.sh 另有一条检查比对 torch / torchvision 的构建标是否一致，混装了会警告。
+# +cu130 is **deliberately omitted** here. Why (measured 2026-08-20 with pip --dry-run):
+#   - With torch==2.11.0 both indexes offer a candidate, but PEP 440 ranks a local version
+#     above the same base version, so 2.11.0+cu130 > 2.11.0 and pip must take the cu130 one
+#     -- exactly what the older --index-url form did, guaranteed by the spec rather than by
+#     luck.
+#   - Writing torch==2.11.0+cu130 actively breaks things: once the wheel is installed, the
+#     version in its dist metadata is stripped back to 2.11.0 (+cu130 survives only in
+#     torch.__version__), so pip decides every time that it is "not installed" and re-downloads
+#     2 GB on every setup.sh run.
+# setup.sh carries a separate check comparing the build tags of torch and torchvision, and
+# warns if they have been mixed.
 --extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.11.0
 torchvision==0.26.0
 
-# ── 其余走 PyPI ────────────────────────────────────────────────────────────
+# -- everything else from PyPI ------------------------------------------------------------
 numpy==2.2.6
 scipy==1.15.3
 matplotlib==3.10.9
@@ -35,14 +44,15 @@ pillow==12.2.0
 tqdm==4.67.3
 pyyaml==6.0.3
 
-# hydra + omegaconf: config.yaml 的解析、override_dirname、输出目录都靠它们，
-# 版本敏感，别乱升（1.3.2 是 config.yaml 里那套 resolver 写法的目标版本）。
+# hydra + omegaconf: parsing config.yaml, override_dirname and the output directory layout all
+# depend on them. Version-sensitive, do not bump casually (1.3.2 is the version the resolver
+# syntax in config.yaml targets).
 omegaconf==2.3.0
 hydra-core==1.3.2
 
 wandb==0.26.1
 
-# transolver++ / tsolverpp / fno 三条线用；code/ 的 HPM 线不碰
+# Used by the transolver++ / tsolverpp / fno lines; the HPM line under code/ does not touch them.
 timm==1.0.26
 einops==0.8.2
 
@@ -50,6 +60,7 @@ xxhash==3.7.0
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
 
-# share 分区上混着 ivybridge 这类老机器，普通 polars 轮子带 avx512 指令，
-# 一跑就 illegal instruction；lts-cpu 这个变体是编给老指令集的。
+# The share partition mixes in older machines such as ivybridge, and the ordinary polars wheel
+# carries avx512 instructions that fault instantly with illegal instruction; the lts-cpu
+# variant is built for the older instruction set.
 polars-lts-cpu==1.33.1

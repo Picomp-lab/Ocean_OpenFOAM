@@ -1,3 +1,4 @@
-# 与 hpc-dash 分开：各自独立的 target 目录，互不触发重编译
+# Kept separate from hpc-dash: each has its own target directory, so neither
+# triggers a rebuild of the other.
 [build]
 target-dir = "target"

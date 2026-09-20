@@ -10,9 +10,9 @@
 #SBATCH --error=logs/%x_%j.err
 
 # ============================================================
-# run.sh — 单 job SLURM 脚本
+# run.sh -- single-job SLURM script
 #
-# 使用:
+# Usage:
 #   cd <repo>/code
 #   mkdir -p logs
 #   sbatch run.sh
@@ -20,11 +20,11 @@
 #   sbatch run.sh pure
 #   sbatch run.sh pure data.channels.5.enabled=false
 #
-# 临时覆盖 SLURM 参数:
+# Overriding SLURM parameters for one submission:
 #   sbatch --partition=ampere --time=02:00:00 run.sh
 #   sbatch --job-name=hpm_pure run.sh pure
 #
-# 崩了先看:
+# First thing to look at after a crash:
 #   sacct -j <jobid> --format=JobID,State,ExitCode,Reason
 # ============================================================
 
@@ -32,13 +32,13 @@ set -euo pipefail
 
 _d="${SLURM_SUBMIT_DIR:-$PWD}"
 while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
-source "$_d/activate.sh"          # 找 conda + 激活环境，并导出 $REPO
+source "$_d/activate.sh"          # find conda, activate the environment, and export $REPO
 
-# ---- `pure` 快捷方式: 纯 HPM 线 ----
-# window=6 -> 基座变成窗口末帧; feedback 必须关
-# ss=false -> p 恒 0, 恒喂 pred
-# Uy / nut 打开
-# αU 关闭
+# ---- the `pure` shortcut: the pure HPM line ----
+# window=6 -> the base becomes the last frame of the window; feedback must be off
+# ss=false -> p is constantly 0, pred is always fed
+# Uy / nut turned on
+# alphaU turned off
 if [[ "${1:-}" == "pure" ]]; then
     shift
     set -- \
@@ -53,7 +53,7 @@ if [[ "${1:-}" == "pure" ]]; then
         "$@"
 fi
 
-# stdout 不缓冲 (unbuffered stdout)
+# unbuffered stdout
 export PYTHONUNBUFFERED=1
 
 python train.py "$@"

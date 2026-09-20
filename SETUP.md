@@ -1,142 +1,161 @@
-# 环境与集群操作
+# Environment and cluster operations
 
-> 这份只管**怎么把环境弄起来、怎么在集群上跑**。
-> 项目本身（六条模型线、数据资产、结果）看 [README.md](README.md)；
-> web 交互演示看 [code/web-demo/README.md](code/web-demo/README.md)。
+> This file covers **how to get the environment up and how to run on the cluster** only.
+> For the project itself (the six model lines, the data assets, the results) see [README.md](README.md);
+> for the interactive web demo see [code/web-demo/README.md](code/web-demo/README.md).
 
-**只能在集群上跑**（数据在 `/nfs/hpc/share`、脚本是 SLURM 的、torch 要 cu130），
-在别的机器上执行 `setup.sh` 会直接报错退出。
+**Runs on the cluster only** (the data is under `/nfs/hpc/share`, the scripts are SLURM scripts,
+torch needs cu130); running `setup.sh` on any other machine errors out immediately.
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
 cd /nfs/hpc/share/$USER
-git clone -b fwv https://github.com/Picomp-lab/Ocean_OpenFOAM.git models
+git clone https://github.com/Picomp-lab/Ocean_OpenFOAM.git models
 cd models && ./setup.sh
 ```
 
-跑完之后：
+Once that finishes:
 
 ```bash
-source activate.sh                # 交互式用；之后可用 $REPO
-cd code && sbatch run.sh          # 训练（sbatch 脚本自己会 source，不用先激活）
+source activate.sh                # for interactive use; $REPO is available afterwards
+cd code && sbatch run.sh          # training (the sbatch scripts source it themselves, so no need to activate first)
 ```
 
-**唯一 `setup.sh` 解决不了的是数据** —— 254 GB 不在版本库里，它只会告诉你缺哪些、
-能不能自己重算、得找谁要（第 5 步会分开讲）。
+**The one thing `setup.sh` cannot solve is the data** -- 254 GB that is not in the repository.
+All it does is tell you what is missing, whether you can recompute it yourself, and who to ask
+(step 5 covers that separately).
 
 ---
 
 ## setup.sh
 
 ```bash
-./setup.sh            # 一条命令跑完：缺什么补什么
-./setup.sh --check    # 只检不装（退出码非 0 = 有缺的）
+./setup.sh            # one command, end to end: installs whatever is missing
+./setup.sh --check    # probe only, install nothing (a non-zero exit = something is missing)
 ```
 
-**只有这一个开关。** 其余全自动：conda 环境和 FUNWAVE-TVD 缺了就装，`archive/` 里有包
-就自动解压。**`archives.tsv` 里的包一个都不能少** —— 少了就算缺件，脚本以非 0 退出
-（各步的检测照样全跑完再退）。三个环境变量可微调，正常不用管：
-`OCEAN_ENV`（环境位置）、`OCEAN_ARCHIVE`（大文件包目录，默认 `<仓库根>/archive`）、
-`SRUN_WAIT`（等计算节点的秒数，设 0 就全留在登录节点）。
+**That is the only switch.** Everything else is automatic: a missing conda environment or
+FUNWAVE-TVD gets installed, and a package sitting in `archive/` is unpacked automatically.
+**Not one package in `archives.tsv` may be absent** -- an absent one counts as a missing part and
+the script exits non-zero (every step's checks still run to completion first). Three environment
+variables allow fine-tuning and normally need no attention: `OCEAN_ENV` (environment location),
+`OCEAN_ARCHIVE` (the large-package directory, default `<repo root>/archive`), and `SRUN_WAIT`
+(seconds to wait for a compute node; 0 keeps everything on the login node).
 
-五步：平台/SLURM → conda 环境（默认 `/nfs/hpc/share/$USER/.conda/envs/ocean`，
-`OCEAN_ENV=` 可改；顺带生成 `.env.local`）→ python 依赖 → wandb → 目录与数据
-（含 `archive/` 自动解压、FUNWAVE-TVD 自动 clone）。web-demo 不在其中，见下。
+Five steps: platform/SLURM -> conda environment (default `/nfs/hpc/share/$USER/.conda/envs/ocean`,
+changeable with `OCEAN_ENV=`; it also generates `.env.local`) -> python dependencies -> wandb ->
+directories and data (including automatic unpacking from `archive/` and an automatic clone of
+FUNWAVE-TVD). web-demo is not among them; see below.
 
-探测和 pip 安装默认 `srun -p share` 丢到计算节点（实测二十几秒调度到，计算节点能出网）
-—— 登录节点每用户 `RLIMIT_NPROC=400` 且全节点共享，挤满时 numpy 起不来，好包会被误判
-成坏的。**不用 `preempt`**：会被抢占 requeue，几十秒的检测反而添乱。`share` 排不上时
-等 180 秒（`SRUN_WAIT=` 可改）就退回登录节点跑，不会把人吊着。
+Probing and pip installation go by default through `srun -p share` onto a compute node (measured:
+scheduled in twenty-odd seconds, and compute nodes have outbound network) -- on a login node
+`RLIMIT_NPROC=400` per user is shared across the whole node, so when it is full numpy will not
+start and a perfectly good package is judged broken. **preempt is not used**: it gets preempted and
+requeued, which only gets in the way of a check that takes tens of seconds. When `share` cannot be
+scheduled it waits 180 seconds (changeable with `SRUN_WAIT=`) and then falls back to the login
+node, rather than leaving you hanging.
 
-### web-demo：clone 下来就能跑
+### web-demo: clone it and it runs
 
-前端 `web/dist/`（108 K）、**后端二进制** `server/target/release/wave-demo`（4.5 M，
-git 里约 1.6 M）、以及 demo 的默认权重（`results/web/model/`，`best.pt` 8.6 M）
-**都在版本库里**，所以不用编、不用配：
+The frontend `web/dist/` (108 K), the **backend binary** `server/target/release/wave-demo` (4.5 M
+on disk, about 1.6 M in git), and the demo's default weights (`results/web/model/`, `best.pt`
+8.6 M) are **all in the repository**, so there is nothing to build and nothing to configure:
 
 ```bash
 ./code/web-demo/start.sh
 ```
 
-`setup.sh` 不碰它 —— 既不核对也不编译。要改要编，完整说明（含必须先前端后后端、
-必须丢计算节点、两条 `srun` 命令）在 [code/web-demo/README.md](code/web-demo/README.md)。
-这里只留一条最容易悄悄坏掉的：**改了 `server/src/` 或 `web/src/` 要自己重编并把新产物
-一起提交**，没人替你检查，源码和二进制会不声不响地对不上。
+`setup.sh` does not touch it -- it neither verifies nor builds it. To change and rebuild it, the
+full instructions (including that the frontend must come before the backend, that it must go to a
+compute node, and the two `srun` commands) are in
+[code/web-demo/README.md](code/web-demo/README.md).
+Only the one most likely to break quietly is repeated here: **after changing `server/src/` or
+`web/src/` you must rebuild and commit the new artifacts yourself** -- nobody checks for you, and
+the source and the binary will drift apart without a sound.
 
-二进制之所以敢进版本库：源码没改时 `cargo build --release` 是**逐字节可复现**的
-（实测两次 md5 相同），不会产生假改动。前端同理 —— 2026-08-23 在 cn-e02 上重跑
-`vite build`，产出与版本库里的逐字节相同。代价是二进制平台锁死：要 `GLIBC_2.28`、
-Linux x86-64，只在这个集群上有意义。
-
----
-
-## 依赖清单
-
-全部在 **`requirements.txt`** 一个文件里，`setup.sh` 一次装完，**不写死任何包名**
-（要加包改这个文件，别改脚本）。torch 系靠文件里的一行 `--extra-index-url` 指向
-pytorch 的 cu130 源，其余走 PyPI。
-
-PyPI 上同样叫 `2.11.0` 的 torch 是 cu12 轮子，装上去计算节点
-`torch.cuda.is_available()` 是 `False`，所以 torch 必须从 pytorch 的源取。
-
-**为什么写 `torch==2.11.0` 而不是 `torch==2.11.0+cu130`**（2026-08-20 用
-`pip install --dry-run` 实测过）：
-
-- 写 `torch==2.11.0`：两个源都有候选，但 PEP 440 规定本地版本号排序高于同基版本，
-  `2.11.0+cu130` > `2.11.0`，pip 必取 cu130 那个。实测结果与旧的 `--index-url`
-  写法完全一致 —— 是规范保证，不是巧合。
-- 写 `torch==2.11.0+cu130`：**反而会坏事**。wheel 装完后 dist 元数据里的版本被剥成
-  `2.11.0`（`+cu130` 只留在 `torch.__version__` 里），pip 每次都判定「没装」，
-  于是每跑一次 `setup.sh` 就重下 2 GB。
-
-`setup.sh` 另有一条检查比对 torch / torchvision 的构建标是否一致，混装了会警告。
-
-> 顺带一提，cu130 源镜像了 117 个包，其中 `numpy` / `pillow` 也在清单里。这不构成
-> 问题：`numpy==2.2.6` 在两个源上是同一份 wheel（sha256 实测相同）。
-
-`polars` 用的是 `lts-cpu` 变体 —— `share` 分区上混着 ivybridge 老机器，普通轮子的
-avx512 指令会 illegal instruction。
-
-版本：Python 3.10.20 / PyTorch 2.11.0+cu130 / CUDA 13.0。
-
-### ⚠️ 别往这个环境里 `conda install` 编译过的包，一律走 pip
-
-集群是 el8，系统 libstdc++ 只到 `GLIBCXX_3.4.25`，比 conda-forge 编译产物要求的
-`3.4.29` 旧。混进来会让 torch 和 numpy 的 C 扩展互相加载不上，而报出来的却是 torch 的
-`NP_SUPPORTED_MODULES` 找不到，很有迷惑性。按 `requirements.txt` 走 PyPI 就不会碰到；
-`setup.sh` 有一条运行时体检（`import torch, numpy.fft, torchvision`）盯着回归。
-
-> 历史：numpy 曾是 conda-forge 构建，2026-08-19 换 PyPI 后根因消失，`LD_LIBRARY_PATH`
-> 兜底 08-20 拆除。**同版本号、不同编译产物**对复现的影响见 [README.md](README.md) §6.7-2。
+Why the binary is allowed into the repository: with unchanged sources, `cargo build --release` is
+**byte-for-byte reproducible** (measured twice, identical md5), so it produces no phantom diffs.
+The frontend is the same -- on 2026-08-23 `vite build` was re-run on cn-e02 and the output was
+byte-identical to what is in the repository. The price is that the binary is platform-locked: it
+needs `GLIBC_2.28` and Linux x86-64, and is only meaningful on this cluster.
 
 ---
 
-## activate.sh —— 脚本怎么找环境
+## Dependency list
 
-**sbatch 脚本一律不写死环境路径**，统一 source 仓库根的 `activate.sh`：
+All of it is in the single file **`requirements.txt`**, installed in one pass by `setup.sh`, which
+**hard-codes no package name** (to add a package, edit that file, not the script). The torch family
+relies on one `--extra-index-url` line in the file pointing at pytorch's cu130 index; the rest comes
+from PyPI.
+
+The torch on PyPI that also calls itself `2.11.0` is a cu12 wheel; install that and
+`torch.cuda.is_available()` is `False` on a compute node, so torch has to come from pytorch's index.
+
+**Why it says `torch==2.11.0` and not `torch==2.11.0+cu130`** (measured 2026-08-20 with
+`pip install --dry-run`):
+
+- With `torch==2.11.0`: both indexes offer a candidate, but PEP 440 ranks a local version above the
+  same base version, so `2.11.0+cu130` > `2.11.0` and pip must take the cu130 one. The measured
+  result is exactly what the older `--index-url` form gave -- guaranteed by the spec, not by luck.
+- With `torch==2.11.0+cu130`: **it actively breaks things**. Once the wheel is installed, the version
+  in its dist metadata is stripped back to `2.11.0` (`+cu130` survives only in `torch.__version__`),
+  so pip decides every time that it is "not installed" and re-downloads 2 GB on every `setup.sh` run.
+
+`setup.sh` carries a separate check comparing the build tags of torch and torchvision, and warns if
+they have been mixed.
+
+> Incidentally, the cu130 index mirrors 117 packages, `numpy` and `pillow` among them, which are
+> also on our list. This is not a problem: `numpy==2.2.6` is the same wheel on both indexes
+> (measured, identical sha256).
+
+`polars` uses the `lts-cpu` variant -- the `share` partition mixes in older ivybridge machines,
+where the avx512 instructions in the ordinary wheel cause an illegal instruction.
+
+Versions: Python 3.10.20 / PyTorch 2.11.0+cu130 / CUDA 13.0.
+
+### WARNING: do not `conda install` compiled packages into this environment; always use pip
+
+The cluster is el8 and the system libstdc++ only reaches `GLIBCXX_3.4.25`, older than the `3.4.29`
+that conda-forge build artifacts require. Mixing them in stops the C extensions of torch and numpy
+from loading each other, and what surfaces is torch failing to find `NP_SUPPORTED_MODULES`, which
+is thoroughly misleading. Following `requirements.txt` through PyPI avoids it entirely, and
+`setup.sh` has a runtime health check (`import torch, numpy.fft, torchvision`) watching for a
+regression.
+
+> History: numpy used to be a conda-forge build; after the switch to PyPI on 2026-08-19 the root
+> cause disappeared, and the `LD_LIBRARY_PATH` workaround was removed on 08-20. For what **the same
+> version number with a different compiled artifact** means for reproducibility, see
+> [README.md](README.md) section 6.7-2.
+
+---
+
+## activate.sh -- how the scripts find the environment
+
+**No sbatch script ever hard-codes an environment path**; they all source `activate.sh` at the repo
+root:
 
 ```bash
 _d="${SLURM_SUBMIT_DIR:-$PWD}"
 while [ ! -f "$_d/activate.sh" ] && [ "$_d" != / ]; do _d=$(dirname "$_d"); done
-source "$_d/activate.sh"      # 找 conda + 激活环境，之后可用 $REPO
+source "$_d/activate.sh"      # find conda, activate the environment; $REPO is available afterwards
 ```
 
-`sbatch` 会把脚本拷到 spool，所以定位靠 `$SLURM_SUBMIT_DIR` 而不是 `$0`。
+`sbatch` copies the script into spool, so locating it relies on `$SLURM_SUBMIT_DIR` rather than `$0`.
 
-环境位置按这个顺序定位，**全程没有任何人的用户名**：
+The environment is located in this order, **with nobody's username anywhere in it**:
 
-1. `$OCEAN_ENV`（显式指定）
-2. `<repo>/.env.local` 里的 `OCEAN_ENV=`（`setup.sh` 生成，不进版本库）
-3. `/nfs/hpc/share/$USER/.conda/envs/ocean`（默认）
+1. `$OCEAN_ENV` (set explicitly)
+2. `OCEAN_ENV=` in `<repo>/.env.local` (generated by `setup.sh`, not committed)
+3. `/nfs/hpc/share/$USER/.conda/envs/ocean` (the default)
 
-### 提交前自查：别写死个人路径
+### Self-check before committing: no hard-coded personal paths
 
-各脚本统一 `source` 仓库根的 `activate.sh`，谁也不该再写死 `/nfs/hpc/share/<某人>/`
-或 `/nfs/stak/users/<某人>/` —— 换个账号 clone 下来就跑不了。**改完脚本、提交之前**
-在仓库根跑一下：
+Every script sources `activate.sh` at the repo root, so nobody should still be writing
+`/nfs/hpc/share/<someone>/` or `/nfs/stak/users/<someone>/` -- clone it under another account and it
+would not run. **After editing a script and before committing**, run this at the repo root:
 
 ```bash
 git ls-files -z '*.sh' '*.py' '*.md' '*.yaml' '*.rs' '*.toml' \
@@ -144,86 +163,98 @@ git ls-files -z '*.sh' '*.py' '*.md' '*.yaml' '*.rs' '*.toml' \
   | grep -vE '/nfs/stak/a1/rhel5apps|/nfs/hpc/share/coast-lab|\$USER|^legacy/'
 ```
 
-无输出 = 干净。三个豁免不算写死个人路径：`rhel5apps` 是全校共享的 conda 安装、
-`coast-lab` 是实验室共享的 FUNWAVE 数据（`gen_prior.sh` / `scan.sh` 指向它）、
-`$USER` 是变量。`legacy/` 不再维护，不参与。
+No output = clean. Three exemptions do not count as hard-coded personal paths: `rhel5apps` is the
+university-wide shared conda installation, `coast-lab` is the lab's shared FUNWAVE data
+(`gen_prior.sh` / `scan.sh` point at it), and `$USER` is a variable. `legacy/` is no longer
+maintained and is not included.
 
 ---
 
-## 仓库外的东西
+## What lives outside the repository
 
-| | 怎么拿 |
+| | how to get it |
 |---|---|
-| `data/`（49 G） | 在云端硬盘，`data_20260822.tar`。也能用 `data/3d/crop_fields.sh` + `code/gen_prior.sh` 重造 |
-| `legacy/` 的产物 | 在云端硬盘，三个包（见下）。仓库里只留源码 |
-| `results/train`、`results/vis` | 在云端硬盘，`results_20260822.tar`。仓库里只剩带 `.gitkeep` 的空目录 |
-| `FUNWAVE-TVD/`（256 M） | 第三方求解器干净 clone，`./setup.sh` 缺了自动拉 |
-| `$OCEAN_DATA` | POD/LSTM 线的 `ocean_project/`，有默认值 |
-| `$OCEAN_CASE` | OpenFOAM 算例，有默认值 |
+| `data/` (49 G) | in cloud storage, `data_20260822.tar`. Can also be rebuilt with `data/3d/crop_fields.sh` + `code/gen_prior.sh` |
+| the output of `legacy/` | in cloud storage, three packages (below). The repo keeps only the source |
+| `results/train`, `results/vis` | in cloud storage, `results_20260822.tar`. The repo keeps only empty directories with a `.gitkeep` |
+| `FUNWAVE-TVD/` (256 M) | a clean clone of the third-party solver; `./setup.sh` pulls it when absent |
+| `$OCEAN_DATA` | `ocean_project/` for the POD/LSTM line; has a default |
+| `$OCEAN_CASE` | the OpenFOAM case; has a default |
 
-版本库本身很小（249 个文件），clone 下来是代码 + 一副带 `.gitkeep` 的空目录骨架，
-每个 `.gitkeep` 写明这个目录的内容在哪个包里、怎么还原。
+The repository itself is small (249 files); a clone gives you the code plus a skeleton of empty
+directories each holding a `.gitkeep` that says which package its contents are in and how to
+restore them.
 
-wandb 没登录**不影响训练**：`train.py` 开跑前自己检测，检测不过就在日志里写明原因、
-本次不记录（不会停在交互提示上，把一个 GPU 作业白熬到超时）。
-project：`hpm-wave`（HPM 两条线）、`tsolverpp`（3D Transolver++），用户 `cassan-osu`。
-本地 `wandb/` 目录是可再生缓存 —— 所有 run 都已同步云端，删了不丢东西。
+Not being logged in to wandb **does not affect training**: `train.py` checks for itself before
+starting and, if the check fails, writes the reason to the log and records nothing this time (it
+never stops at an interactive prompt and burns a GPU job until it times out).
+Projects: `hpm-wave` (the two HPM lines) and `tsolverpp` (3D Transolver++), user `cassan-osu`.
+The local `wandb/` directory is a regenerable cache -- every run is already synced to the cloud, so
+deleting it loses nothing.
 
-### 云端大文件（`archive/`）
+### Large files in the cloud (`archive/`)
 
-历史的可视化产物和 checkpoint 近 1 G，二进制在 git 里不做 delta 压缩、每改一版就整份
-再存一遍，所以放云端硬盘而不是版本库。清单在仓库根的 **`archives.tsv`**（6 列 TAB 分隔，
-格式说明写在文件头部）：
+The historical visualisations and checkpoints come to nearly 1 G, and git does not delta-compress
+binaries -- every new version is stored whole again -- so they live in cloud storage rather than in
+the repository. The list is **`archives.tsv`** at the repo root (6 TAB-separated columns; the format
+is described in that file's header):
 
-| 包 | 解压到 | 大小 | 内容 |
+| package | unpacks to | size | contents |
 |---|---|---|---|
-| `data_20260822.tar` | `data/` | 48.6 G | 3d 34.5 G + fwv 8.5 G + 2d 5.6 G，12122 个文件 |
-| `legacy_20260822.tar` | `legacy/`（**不含 hpm**） | 12.7 G | fno 12.6 G（`processed_data` + `outputs`）、`transolver++/results`、`tsolverpp/outputs` |
-| `legacy_hpm_vis_20260820.tar` | `legacy/hpm/vis/` | 486 M | 334 个 mp4，46 组历史可视化 |
-| `legacy_hpm_outputs_20260820.tar` | `legacy/hpm/outputs/` | 428 M | 46 个 run 的 `checkpoints/*.pt` + `.hydra/*.yaml` |
-| `results_20260822.tar` | `results/` | 194 M | `train/` 87 M + `vis/` 56 M + web-demo 那两次跑的留档 |
+| `data_20260822.tar` | `data/` | 48.6 G | 3d 34.5 G + fwv 8.5 G + 2d 5.6 G, 12122 files |
+| `legacy_20260822.tar` | `legacy/` (**excluding hpm**) | 12.7 G | fno 12.6 G (`processed_data` + `outputs`), `transolver++/results`, `tsolverpp/outputs` |
+| `legacy_hpm_vis_20260820.tar` | `legacy/hpm/vis/` | 486 M | 334 mp4 files, 46 sets of historical visualisations |
+| `legacy_hpm_outputs_20260820.tar` | `legacy/hpm/outputs/` | 428 M | `checkpoints/*.pt` + `.hydra/*.yaml` for 46 runs |
+| `results_20260822.tar` | `results/` | 194 M | `train/` 87 M + `vis/` 56 M + the record of those two web-demo runs |
 
-还原逻辑只有 `restore.sh` 一份，`setup.sh` 第 5 步就是调它（`--check` 会透传）：
+The restore logic exists in `restore.sh` alone, and step 5 of `setup.sh` simply calls it (`--check`
+is passed through):
 
 ```bash
-./setup.sh                      # 连环境一起装；包缺了算缺件，退出码非 0（各步照样查完）
-./archive/restore.sh            # 只管包：全量扫描 -> 全了才解 -> 解完逐文件核 manifest
-                                # 缺一件就列全问题 exit 1，一个字节都不解
-./archive/restore.sh --check    # 只体检不解
-./archive/restore.sh web        # 只解 web-demo 要的那个包（= data 包）
-./archive/restore.sh data_      # 指名解手上有的（按包名子串挑，日期和 .tar 可不写）
+./setup.sh                      # installs the environment too; a missing package counts as a missing part, exit code non-zero (every step is still checked)
+./archive/restore.sh            # packages only: full scan -> unpack only when complete -> verify each file against the manifest afterwards
+                                # one missing and it lists every problem, exit 1, not a byte unpacked
+./archive/restore.sh --check    # inspect only, unpack nothing
+./archive/restore.sh web        # unpack only what web-demo needs (= the data package)
+./archive/restore.sh data_      # name the ones you have (matched by substring; the date and .tar can be omitted)
 ```
 
-**手上只有一部分包**时走最后那种 —— 不带参数是"全有才动手"，缺一个就什么都不解。
+**When you have only some of the packages**, use the last form -- with no argument it "acts only
+when everything is present", and one missing package means nothing is unpacked.
 
-`restore.sh` 用 `tar --skip-old-files`，已存在的文件一律不覆盖 —— 有几个包跟版本库
-是重叠的（比如 `data/fwv/TK94/input.txt`），不加这个开关一次还原就会把版本库的版本
-静默盖掉。
+`restore.sh` uses `tar --skip-old-files` and never overwrites an existing file -- several packages
+overlap with the repository (`data/fwv/TK94/input.txt`, for instance), and without that flag a
+single restore would silently overwrite the repository's version.
 
-行为（两个入口都一样，因为是同一份代码）：**探测路径已存在且非空就跳过**（`.gitkeep`
-不算数；幂等，可以反复跑）；否则去 `archive/` 找包，**校验 md5 通过**才解压；`archive/`
-里也没有就**报缺件**，并打印一条可以直接复制的下载命令（来自 `archives.tsv` 第 6 列，
-支持 `gdrive:<FILE_ID>` 和 `https://` 直链；第 6 列留空时提示"找仓库主人要"）。
+Behaviour (identical through both entry points, because it is the same code): **a probe path that
+exists and is non-empty is skipped** (`.gitkeep` does not count; idempotent, so it can be re-run
+freely); otherwise it looks for the package in `archive/` and unpacks it **only after the md5
+verifies**; when it is not in `archive/` either it **reports a missing part** and prints a download
+command you can copy straight out (from column 6 of `archives.tsv`, supporting `gdrive:<FILE_ID>`
+and direct `https://` links; when column 6 is empty it says to ask the repo owner).
 
-**不会自动联网下载** —— 近 1 G，什么时候拉由人决定。但**包不齐 `setup.sh` 就算失败**
-（退出码非 0）：`data_*.tar` 是训练数据，没它什么都跑不了；其余几个虽然只影响翻历史，
-也一并按缺件计，免得"装完了"和"装齐了"混为一谈。
+**It never downloads over the network on its own** -- nearly 1 G, so when to fetch it is a human's
+decision. But **an incomplete set of packages makes `setup.sh` fail** (non-zero exit): `data_*.tar`
+is the training data and nothing runs without it, and while the others only affect digging through
+history, they count as missing parts too, so that "finished installing" and "installed completely"
+are not confused.
 
-每个包旁边还有一份 `.manifest`（逐文件 md5），拿到之后可以逐个核而不只是核整包：
+Beside each package there is also a `.manifest` (per-file md5), so once you have one you can verify
+file by file rather than just the package as a whole:
 
 ```bash
-cd <仓库根> && md5sum -c $OCEAN_ARCHIVE/legacy_hpm_vis_20260820.manifest
+cd <repo root> && md5sum -c $OCEAN_ARCHIVE/legacy_hpm_vis_20260820.manifest
 ```
 
 ---
 
-## SLURM 速查
+## SLURM quick reference
 
-| 分区 | 硬件 | 本项目用法 |
+| partition | hardware | use in this project |
 |---|---|---|
-| `dgxh` | H100 80GB / H200 143GB | 所有 GPU 训练 |
-| `ampere` | **A40 48G**（没有 A100） | 推理、出图、动画；不收纯 CPU 作业（QOS `MinTRES=gres/gpu=1`） |
-| `eecs` / `share` | CPU（`eecs` 另有 RTX2080 11G） | 数据准备、POD、LSTM、prior 生成与标定 |
+| `dgxh` | H100 80GB / H200 143GB | all GPU training |
+| `ampere` | **A40 48G** (no A100) | inference, rendering, animation; rejects pure-CPU jobs (QOS `MinTRES=gres/gpu=1`) |
+| `eecs` / `share` | CPU (`eecs` also has RTX2080 11G) | data preparation, POD, LSTM, prior generation and calibration |
 
 ```bash
 squeue -u $USER
@@ -231,17 +262,18 @@ sacct -j <jobid> --format=JobID,JobName,Elapsed,State,ExitCode,Reason,MaxRSS
 tail -f code/logs/hpm_<jobid>.log
 ```
 
-⚠️ `code/logs/` 必须在**提交前**就存在 —— `#SBATCH --output` 在脚本执行之前生效，
-目录不在时 SLURM 会把日志整个丢掉，而作业状态照样是 `COMPLETED`（实测）。
-`setup.sh` 会建好。
+WARNING: `code/logs/` must exist **before submitting** -- `#SBATCH --output` takes effect before the
+script runs, and when the directory is missing SLURM discards the log entirely while the job still
+reports `COMPLETED` (measured). `setup.sh` creates it.
 
-想知道现在投哪个分区最快，别只信 `sbatch --test-only`（它给的是最坏情况的优先级排队
-模拟，不算 backfill，也不检查 pending 作业是否真能跑起来）。直接看：
+To find out which partition is fastest to submit to right now, do not rely on
+`sbatch --test-only` alone (it gives a worst-case priority queue simulation, ignores backfill, and
+does not check whether pending jobs can actually start). Look directly:
 
 ```bash
-sinfo -p <part> -N -o '%N|%t|%C|%G'        # 有没有 idle 节点
-squeue -p <part> -t PD -o '%i|%u|%r|%b'    # PENDING 卡在什么原因上
+sinfo -p <part> -N -o '%N|%t|%C|%G'        # are there idle nodes
+squeue -p <part> -t PD -o '%i|%u|%r|%b'    # what reason the PENDING ones are stuck on
 ```
 
-有 IDLE 节点、PENDING 又全卡在 `Dependency`（尤其 `DependencyNeverSatisfied`，永远不会
-跑）上 —— 直接投，会立刻起。
+Idle nodes present and every PENDING job stuck on `Dependency` (especially
+`DependencyNeverSatisfied`, which will never run) -- submit, and it starts immediately.

@@ -309,7 +309,7 @@ quoting right — one botched quote is arbitrary command execution. The validato
 `valid_case_name` / `valid_field` / `valid_job_id` in `wave.rs`.
 
 ⚠️ They currently have **no test coverage**. An earlier version of this file claimed a
-test `wave::tests::校验挡住注入` guarded them; no such test exists (as of 2026-08-23 the
+test in `wave::tests` guarded them; no such test exists (as of 2026-08-23 the
 crate's 18 tests cover path resolution, job-state merging, Range parsing and checkpoint
 scanning). Worth adding.
 

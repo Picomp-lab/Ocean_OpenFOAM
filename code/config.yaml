@@ -1,107 +1,128 @@
 # ============================================================
-# config.yaml — 唯一配置文件。
+# config.yaml -- the single configuration file.
 #
-# 两条模型线由 data.window 单参数区分:
-#   window == 0   HPM + FUNWAVE (fwv)   残差加在 prior(t) 上   ← 默认, 当前主力
-#   window >= 3   纯 HPM (pure HPM)     残差加在自己上一帧      前一阶段, 已完成
-# 二者不是自由组合: window>0 才有历史帧可作基座, window=0 则没有。
+# The two model lines are distinguished by the single parameter data.window:
+#   window == 0   HPM + FUNWAVE (fwv)   residual added on top of prior(t)   <- default, current main line
+#   window >= 3   pure HPM              residual added on top of its own previous frame   earlier stage, finished
+# The two are not freely combinable: only window>0 has history frames to use as a base,
+# window=0 has none.
 #
 # ------------------------------------------------------------
-# 复现表 (REPRODUCTION TABLE) —— 每个跑过的 run 一行
+# REPRODUCTION TABLE -- one line per run that was actually performed
 # ------------------------------------------------------------
-#  run 名                    命令
+#  run name                  command
 #  --------------------------------------------------------------------------
 #  hpm_fw_aU_h128            python train.py
-#      默认配置 = prior + 自反馈 + SS(R=4) + αU 加权。**当前最佳臂**。
-#      判据是可视化结果 (近岸形态), 不是 val nRMSE —— 见下方 "αU 的比较陷阱"。
+#      Default configuration = prior + self-feedback + SS(R=4) + alphaU weighting.
+#      **Current best arm**. The criterion is the visualised result (nearshore shape),
+#      not val nRMSE -- see "The alphaU comparison trap" below.
 #
 #  hpm_fw_h128               python train.py data.channels.1.alpha_weighted=false \
 #                                            data.channels.3.alpha_weighted=false
-#      非 αU 变体 (速度通道不乘 alpha)。
+#      Non-alphaU variant (velocity channels are not multiplied by alpha).
 #
 #  hpm_fw_nofb_h128          python train.py rollout.feedback=none rollout.R=1 \
 #                                data.channels.1.alpha_weighted=false \
 #                                data.channels.3.alpha_weighted=false
-#      无反馈基线; 纯 "prior 场 -> CFD 场" 单步映射, 无 rollout 无冷启动。
-#      (历史上跑过的这一支是非 αU 的, 故显式关掉; 想要 αU 版就去掉后两行,
-#       名字会变成 hpm_fw_nofb_aU_h128)
+#      No-feedback baseline; a plain "prior field -> CFD field" single-step mapping, with
+#      no rollout and no cold start.
+#      (The branch that was actually run historically is the non-alphaU one, hence the
+#       explicit disabling; for an alphaU version drop the last two lines and the name
+#       becomes hpm_fw_nofb_aU_h128)
 #
-#  --- 纯 HPM 线 (前一阶段, 不再迭代) ---
-#  切过去要带四组参数 (窗口 / 反馈 / SS / 通道):
+#  --- pure HPM line (earlier stage, no longer iterated) ---
+#  Switching to it takes four groups of parameters (window / feedback / SS / channels):
 #      data.window=6 rollout.feedback=none rollout.ss=false
 #      data.channels.1.alpha_weighted=false data.channels.3.alpha_weighted=false
 #      data.channels.2.enabled=true data.channels.5.enabled=true
-#  单 yaml 的代价, 但显式。run.sh 已封成 `./run.sh pure ...`, 不必手抄;
-#  忘带 rollout.ss=false 会被 build_policy 断言拦住, 不会静默跑成别的东西。
+#  That is the price of a single yaml, but it is explicit. run.sh already wraps it as
+#  `./run.sh pure ...`, so there is no need to copy it by hand; forgetting rollout.ss=false
+#  is caught by a build_policy assertion rather than silently running something else.
 #    hpm_bl_h128       ./run.sh pure
 #    nut frozen        ./run.sh pure data.channels.5.update_rule=frozen \
 #                                    data.channels.5.loss_weight=0.0
 #    nut disabled      ./run.sh pure data.channels.5.enabled=false
 #
 # ------------------------------------------------------------
-# αU 的比较陷阱 (读 nRMSE 前必看)
+# The alphaU comparison trap (read before reading any nRMSE)
 # ------------------------------------------------------------
-# αU 与非 αU 的 nRMSE **不在同一个空间**, 不能直接比大小:
-#   αU     stats_c1-7_alpha.Uxw.Uzw.p_rgh.npy   Ux 的 Δ=0 基线 0.619
-#   非 αU  stats_c1-7_alpha.Ux.Uz.p_rgh.npy     Ux 的 Δ=0 基线 0.896
-# 归一化的量本身换了 (αUx vs Ux), 分母不同。stats 文件名带 'w' 后缀就是这个
-# 原因 (schema.signature())。跨臂比较只能用共同空间的指标 —— `vis.py pred` 输出的
-# raw 空间 slice-RMSE, 或分区域的近岸形态。
+# alphaU and non-alphaU nRMSE values **do not live in the same space** and cannot be
+# compared directly:
+#   alphaU      stats_c1-7_alpha.Uxw.Uzw.p_rgh.npy   Delta=0 baseline for Ux is 0.619
+#   non-alphaU  stats_c1-7_alpha.Ux.Uz.p_rgh.npy     Delta=0 baseline for Ux is 0.896
+# The normalised quantity itself has changed (alphaUx vs Ux), so the denominators differ.
+# That is exactly why the stats filename carries a 'w' suffix (schema.signature()).
+# Cross-arm comparison is only valid on a metric in a shared space -- the raw-space
+# slice-RMSE emitted by `vis.py pred`, or the nearshore shape region by region.
 #
-# 另注: 当前 config 未固定随机种子。同配置重跑 best_val 有 ~2% 抖动
-# (实测 0.1549 vs 0.1512), 且刷新出现的 epoch 会大幅移动。
+# Also note: the current config does not fix a random seed. Re-running the same
+# configuration moves best_val by about 2% (measured: 0.1549 vs 0.1512), and the epoch at
+# which the best appears shifts considerably.
 #
 # ------------------------------------------------------------
-# 纪律: 改这个文件 = **定义新 baseline**; 跑变体走 CLI 覆盖。
-#   CLI 覆盖会自动进 hydra 目录名与 wandb run 名 (override_dirname), 改 yaml
-#   不会 —— 所以 rollout.R=4 与 R=8 若都靠改 yaml, 两次 run 会同名。
+# Discipline: editing this file = **defining a new baseline**; run variants through CLI
+# overrides.
+#   A CLI override automatically enters the hydra directory name and the wandb run name
+#   (override_dirname); editing the yaml does not -- so if rollout.R=4 and R=8 were both
+#   done by editing the yaml, the two runs would end up with the same name.
 # ------------------------------------------------------------
 data:
   dir: ${repo:}/data/3d/cropped_0.05
-  # 逐 chunk t-offset 标定后重新生成 (toffset_scan/c00*.json -> gen_prior.sh)。
-  # best_k[1..9] = [1,3,5,5,4,3,2,4,6] —— 非单调, 所以没有"漂移模型"可套,
-  # 只能逐 chunk 标。window>0 (纯 HPM) 时本项被忽略。
+  # Regenerated after per-chunk t-offset calibration
+  # (toffset_scan/c00*.json -> gen_prior.sh).
+  # best_k[1..9] = [1,3,5,5,4,3,2,4,6] -- not monotonic, so there is no "drift model" to
+  # apply; it has to be calibrated chunk by chunk. Ignored when window>0 (pure HPM).
   prior_dir: ${repo:}/data/3d/cropped_0.05/prior_ktuned
 
-  # chunk range: [single] 或 [start, end] (闭区间)
-  # chunk 9 的 prior 此前失效 (固定 offset 下 raw 空间 Uz nRMSE=1.02 > 1)。逐
-  # chunk 标定发现最优 k=+6 而非 +3 —— 那是配准误差, 不是数据问题。重新生成后
-  # Uz nRMSE=0.957 < 1, chunk 9 已是有效 test chunk。
+  # chunk range: [single] or [start, end] (inclusive)
+  # The prior for chunk 9 used to be ineffective (raw-space Uz nRMSE=1.02 > 1 under a fixed
+  # offset). Per-chunk calibration found the optimum at k=+6 rather than +3 -- that was a
+  # registration error, not a data problem. After regeneration Uz nRMSE=0.957 < 1, so
+  # chunk 9 is now a valid test chunk.
   train_chunk_range: [1, 7]
   val_chunk_range: [8]
   test_chunk_range: [9]
 
-  # 0 -> fwv 线 (基座 = prior);  >=3 -> 纯 HPM (基座 = 窗口末帧, 需要有限差分)
+  # 0 -> fwv line (base = prior);  >=3 -> pure HPM (base = last frame of the window,
+  # requires finite differences)
   window: 0
 
   # ============================================================
-  # Channel schema — SINGLE SOURCE OF TRUTH (见 schema.py)。
-  # 这里的顺序 == 张量通道顺序。其余全部派生: field_dim, out_dim, loss 权重,
-  # alpha 加权, stats 文件名。
+  # Channel schema -- SINGLE SOURCE OF TRUTH (see schema.py).
+  # The order here == the tensor channel order. Everything else is derived from it:
+  # field_dim, out_dim, loss weights, alpha weighting, stats filename.
   #
-  #   enabled:        false = 该通道对模型完全不存在 (非输入、无 head、无 stats、
-  #                   不计入 field_dim)。'alpha' 不可 disable。
-  #   update_rule:    delta  = 由 delta head 预测
-  #                   frozen = 仍是输入, rollout 中原样携带, 无 head 无 loss
-  #                   flux_div = 预留给 flux head, 未实现 (会抛 NotImplementedError)
-  #   loss_weight:    z-normalized delta 空间的逐通道 MSE 权重 (相对重要性,
-  #                   非物理量纲)。影响梯度 **和** val_loss (即 best.pt 选择)。
-  #                   绝不要 update_rule=delta 配 loss_weight=0.0 ——
-  #                   无监督的 head 会污染 rollout; 用 frozen 或 enabled:false。
-  #   alpha_weighted: 物理空间内乘以 alpha (水相体积分数)
+  #   enabled:        false = the channel does not exist for the model at all (not an input,
+  #                   no head, no stats, not counted in field_dim). 'alpha' cannot be
+  #                   disabled.
+  #   update_rule:    delta  = predicted by the delta head
+  #                   frozen = still an input, carried through rollout unchanged, no head
+  #                            and no loss
+  #                   flux_div = reserved for a flux head, not implemented (raises
+  #                            NotImplementedError)
+  #   loss_weight:    per-channel MSE weight in z-normalized delta space (relative
+  #                   importance, not a physical unit). Affects the gradient **and**
+  #                   val_loss (hence the choice of best.pt).
+  #                   Never combine update_rule=delta with loss_weight=0.0 -- an
+  #                   unsupervised head will contaminate the rollout; use frozen or
+  #                   enabled:false instead.
+  #   alpha_weighted: multiplied by alpha (water volume fraction) in physical space
   #
-  # 下面的开关状态针对 fwv 线。通道取舍依据 diag_prior.py
-  # (chunk 1-9, prior_ktuned, raw 空间, 跨 chunk 均值):
-  #   通道    nRMSE_prior   corr     判定
-  #   alpha      0.410      0.918    有效
-  #   p_rgh      0.647      0.806    有效
-  #   Ux         0.896      0.521    弱有效
-  #   Uz         0.930      0.403    弱有效
-  #   Uy         1.002     -0.001    无效 —— corr≈0, 比常数基线还差, prior 在加噪
-  #   nut         --         --      FUNWAVE 无湍流模型, 结构上没有 prior
+  # The switch states below are for the fwv line. Channel selection follows diag_prior.py
+  # (chunks 1-9, prior_ktuned, raw space, averaged across chunks):
+  #   channel  nRMSE_prior   corr     verdict
+  #   alpha       0.410      0.918    effective
+  #   p_rgh       0.647      0.806    effective
+  #   Ux          0.896      0.521    weakly effective
+  #   Uz          0.930      0.403    weakly effective
+  #   Uy          1.002     -0.001    ineffective -- corr~0, worse than a constant baseline;
+  #                                   the prior is adding noise
+  #   nut          --         --      FUNWAVE has no turbulence model, so structurally there
+  #                                   is no prior
   #
-  # Ux / Uz 的 alpha_weighted=true 是当前最佳臂。跑纯 HPM 线时应关掉 (那条线
-  # 没有 prior, αU 的动机不成立), run.sh 的 `pure` 已代劳。
+  # alpha_weighted=true on Ux / Uz is the current best arm. It should be turned off when
+  # running the pure HPM line (that line has no prior, so the motivation for alphaU does not
+  # hold); the `pure` mode of run.sh already does this.
   # ============================================================
   channels:
     - {name: alpha, enabled: true,  update_rule: delta, loss_weight: 1.0, alpha_weighted: false}
@@ -112,28 +133,36 @@ data:
     - {name: nut,   enabled: false, update_rule: delta, loss_weight: 0.1, alpha_weighted: false}
 
 # ------------------------------------------------------------
-# rollout — 三个可变轴 (基座轴由 data.window 推导, 不在这里)
+# rollout -- three variable axes (the base axis is derived from data.window and is not here)
 # ------------------------------------------------------------
 rollout:
-  # none | self  —— 自反馈槽, 仅 fwv 线支持 (纯 HPM 的窗口本身已是状态)
-  #   none  输入 = [prior],         F 通道
-  #   self  输入 = [prior | x_f*m], 2F 通道; 屏蔽由 x_f*m 完成 (算术恒等)
+  # none | self -- the self-feedback slot, supported on the fwv line only (the window of the
+  # pure HPM line is already a state)
+  #   none  input = [prior],         F channels
+  #   self  input = [prior | x_f*m], 2F channels; masking is done by x_f*m (an arithmetic
+  #         identity)
   feedback: self
 
-  R: 4          # rollout 展开步数 (真 BPTT; 序列内严格顺序, 序列间随机起点)
+  R: 4          # number of rollout steps (true BPTT; strictly ordered within a sequence,
+                # random start point between sequences)
 
-  # scheduled sampling 总开关。false -> p 恒 0 (全自回归 = 部署条件),
-  # 下面三个 p_* 全部忽略。开关只在 train.py main 里生效一次。
-  # 纯 HPM 线**必须** ss=false (那条线的历史行为是恒喂 pred); build_policy
-  # 会断言, 只写 data.window=6 而忘了关会直接失败而不是静默出错数。
+  # Master switch for scheduled sampling. false -> p is constantly 0 (fully autoregressive =
+  # deployment condition), and the three p_* below are all ignored. The switch takes effect
+  # exactly once, in train.py main.
+  # The pure HPM line **must** use ss=false (its historical behaviour is to always feed pred);
+  # build_policy asserts this, so setting data.window=6 while forgetting to turn it off fails
+  # outright instead of silently producing wrong numbers.
   ss: true
 
-  # SS 的退火参数 (仅 ss=true 时生效)。p = 喂 GT 的概率, 治 exposure bias。
-  #   p=1 teacher forcing (断链)   p=0 全自回归 = 部署条件 (保链)
-  # val 恒 p=0, 与部署一致。R=1 时 p 不起作用 (没有 r>=1 的步)。
+  # Annealing parameters for SS (in effect only when ss=true). p = probability of feeding GT,
+  # which treats exposure bias.
+  #   p=1 teacher forcing (chain broken)   p=0 fully autoregressive = deployment condition
+  #                                        (chain kept)
+  # val is always p=0, matching deployment. p has no effect when R=1 (there is no step with
+  # r>=1).
   p_start: 1.0
   p_end: 0.1
-  anneal_frac: 0.6      # 退火占 epochs 的比例; <=0 表示恒 p_end
+  anneal_frac: 0.6      # fraction of epochs spent annealing; <=0 means p_end throughout
 
 model:
   n_hidden: 128
@@ -149,8 +178,9 @@ train:
   batch_size: 1
   lr: 5e-4
   weight_decay: 1e-4
-  # 注: 50 epoch x ~1780s ≈ 24.7h, 会撞 SLURM 24h 墙 (实测两次都停在 epoch 47)。
-  # 末 15 个 epoch 已平, 降到 30 可跑完且不损失 —— 暂未改, 待定。
+  # Note: 50 epochs x ~1780s ~= 24.7h, which hits the 24h SLURM wall (measured twice, both
+  # stopped at epoch 47). The last 15 epochs are already flat, so 30 would finish without
+  # losing anything -- not changed yet, still to be decided.
   epochs: 50
   max_grad_norm: 1.0
   num_workers: 4
@@ -158,8 +188,10 @@ train:
 hydra:
   job:
     config:
-      # CLI 覆盖自动进入目录名与 wandb 运行名 (超参 diff 的自动编码)。
-      # 与 runname 互补: runname 管模型线 + schema diff, 这里管超参 diff。
+      # CLI overrides automatically enter the directory name and the wandb run name (an
+      # automatic encoding of the hyperparameter diff).
+      # Complementary to runname: runname covers the model line + schema diff, this covers
+      # the hyperparameter diff.
       override_dirname:
         exclude_keys: [wandb.enabled, wandb.name, wandb.name_suffix,
                        train.num_workers]
@@ -177,18 +209,20 @@ save:
 wandb:
   enabled: true
   project: hpm-wave
-  # 运行名自动派生 (train.py run_name):
+  # The run name is derived automatically (train.py run_name):
   #   window>0 -> schema.auto_run_name    hpm_bl_h128 / hpm_no-nut_h128
   #   window=0 -> hpm_fw[_nofb][_aU|_aUx|_aUz]_h{n}
   #
-  # 名字只编码**相对默认配置的 diff**:
-  #   nofb    关掉自反馈 (默认 self)
-  #   aU 系列 列出被 alpha 加权的速度通道 —— 与纯 HPM 线同向 (加权了才显示):
-  #             Ux+Uz -> aU    只 Ux -> aUx    只 Uz -> aUz    都没有 -> 省略
-  #   h{n}    模型容量常驻 (将来要横向比较的一列, 埋进 override_dirname 不好认)
-  # R / lr 等超参不在这里编码 —— 走 CLI 时 override_dirname 已经追加了,
-  # 例如 rollout.R=8 -> hpm_fw_aU_h128_rollout.R-8
-  # 手动覆盖: python train.py wandb.name=custom
-  # 加尾标:   python train.py wandb.name_suffix=lr5e4
+  # The name encodes **only the diff against the default configuration**:
+  #   nofb        self-feedback turned off (default is self)
+  #   aU family   lists the velocity channels that are alpha-weighted -- same polarity as the
+  #               pure HPM line (shown only when weighted):
+  #                 Ux+Uz -> aU    Ux only -> aUx    Uz only -> aUz    neither -> omitted
+  #   h{n}        model capacity, always present (a column meant for later cross-comparison;
+  #               buried inside override_dirname it would be hard to spot)
+  # Hyperparameters such as R / lr are not encoded here -- when set from the CLI,
+  # override_dirname has already appended them, e.g. rollout.R=8 -> hpm_fw_aU_h128_rollout.R-8
+  # Manual override: python train.py wandb.name=custom
+  # Add a suffix:    python train.py wandb.name_suffix=lr5e4
   name: ${runname:}
   name_suffix: ""
